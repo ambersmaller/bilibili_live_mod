@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import random
 import time
 import uuid
 from collections import OrderedDict
@@ -17,6 +16,7 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from .batch_buffer import BatchBuffer
 from .blivedm import WebClient, OpenLiveClient
 from .blivedm.clients.ws_base import USER_AGENT
 from .blivedm.models import message as bili_msg
@@ -58,6 +58,9 @@ COMMENT_RULES = (
 # 重复弹幕回复缓存容量（条）：弹幕复读文化下相同内容的弹幕直接复用回复，跳过LLM调用
 REPLY_CACHE_MAX = 200
 
+# 攒批回复的上下文键：批量消息作为一段对话计入上下文记录器（非真实用户ID，避免与观众冲突）
+BATCH_SENDER_KEY = "_batch_danmaku"
+
 # 直播间进房/在线心跳接口（模拟网页端行为，让账号出现在直播间在线列表）
 ROOM_ENTRY_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/roomEntryAction"
 ROOM_INFO_URL = "https://api.live.bilibili.com/room/v1/Room/get_info"
@@ -70,7 +73,7 @@ X25KN_X_URL = "https://live-trace.bilibili.com/xlive/data-interface/v1/x25Kn/X"
 X25KN_HMAC_FUNCS = ["md5", "sha1", "sha256", "sha224", "sha512", "sha384"]
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.4.1")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.5.0")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -98,6 +101,30 @@ class BilibiliLive(Star):
             item.strip().lower()
             for item in self.config["plugin_settings"]["allow_message_type"].split(",")
         }
+        # 弹幕攒批回复：聚合多条直播消息后打包发给LLM，只回复一条（仅弹幕机器人模式启用）
+        batch_conf = (
+            self.config.get("plugin_settings", {}).get("batch_reply", {}) or {}
+        )
+        self._batch_no_wait_types = {
+            t.strip().lower()
+            for t in str(batch_conf.get("no_wait_types") or "").split(",")
+            if t.strip()
+        }
+        self.batch_buffer: BatchBuffer | None = None
+        if (
+            self.config["plugin_settings"].get("work_mode") == "danmaku_bot"
+            and batch_conf.get("enable")
+        ):
+            self.batch_buffer = BatchBuffer(
+                max_batch=batch_conf.get("max_batch") or 5,
+                max_wait=batch_conf.get("max_wait") or 10.0,
+                on_flush=self._batch_flush,
+            )
+            logger.info(
+                f"弹幕攒批回复已启用：攒够 {batch_conf.get('max_batch') or 5} 条"
+                f"或等待 {batch_conf.get('max_wait') or 10.0} 秒即打包回复一条；"
+                f"不等待类型: {sorted(self._batch_no_wait_types) or '无'}"
+            )
         self._process_task: asyncio.Task | None = None
         self._live_monitor_task: asyncio.Task | None = None
         self._is_live = False
@@ -891,6 +918,10 @@ class BilibiliLive(Star):
     async def _stop_web_client(self):
         """停止弹幕处理任务、弹幕发送器并关闭web客户端"""
         await self._stop_room_presence()
+        if self.batch_buffer:
+            dropped = self.batch_buffer.reset()
+            if dropped:
+                logger.info(f"断开直播间，丢弃未冲刷的 {dropped} 条攒批消息")
         if self.danmaku_sender:
             await self.danmaku_sender.stop()
             self.danmaku_sender = None
@@ -913,28 +944,60 @@ class BilibiliLive(Star):
         """从消息中提取发送者ID"""
         return message.user_id if message.user_id != "0" else message.user_name
 
+    # 直播消息类型名映射（顺序即分类优先级，与 _handle_message 分支一致）
+    _MSG_TYPE_MAP = (
+        (bili_msg.DanmakuMessage, "danmaku"),
+        (bili_msg.GiftMessage, "gift"),
+        (bili_msg.SuperChatMessage, "super_chat"),
+        (bili_msg.LikeMessage, "like"),
+        (bili_msg.EnterRoomMessage, "enter_room"),
+        (bili_msg.GuardBuyMessage, "guard_buy"),
+    )
+
+    @classmethod
+    def _message_type_name(cls, message) -> str | None:
+        """从消息对象提取类型名（danmaku/gift/super_chat/like/enter_room/guard_buy）"""
+        for msg_cls, name in cls._MSG_TYPE_MAP:
+            if isinstance(message, msg_cls):
+                return name
+        return None
+
+    def _format_live_item(
+        self, message, msg_type: str, content: str | None = None
+    ) -> str:
+        """把直播消息格式化为注入提示词的文本（逐条回复与攒批共用同一格式）"""
+        user = f"{message.user_name}({message.user_id})"
+        if msg_type == "danmaku":
+            return f"[弹幕] {user}说: {content}"
+        if msg_type == "gift":
+            return f"[礼物] {user}赠送了{message.gift_num}个{message.gift_name}"
+        if msg_type == "super_chat":
+            return f"[醒目留言] {user}说: {message.message}"
+        if msg_type == "like":
+            return f"[点赞] {user}点赞了"
+        if msg_type == "enter_room":
+            return f"[进入直播间] {user}进入了直播间"
+        if msg_type == "guard_buy":
+            guard_level_names = {1: "总督", 2: "提督", 3: "舰长"}
+            return f"[上舰] {user}成为了{guard_level_names.get(message.guard_level, '未知')}"
+        return ""
+
     async def _handle_message(self, message: bili_msg.BiliMessage):
         """处理消息分类"""
         # 忽略机器人账号自己发出的消息（弹幕流会回显自己发送的弹幕，不过滤会导致自我回复套娃）
         if self._self_mid and str(message.user_id) == self._self_mid:
             logger.debug(f"忽略机器人自己发送的消息: {message.user_name}({message.user_id})")
             return
-        if self.config["plugin_settings"]["random_drop"]["enable"]:
-            if (
-                random.random()
-                < self.config["plugin_settings"]["random_drop"]["drop_rate"]
-            ):
-                logger.debug("Drop message")
-                return
+
+        msg_type = self._message_type_name(message)
+        if msg_type is None or msg_type not in self.allow_message_type:
+            return
 
         sender = self._get_sender_id(message)
-
-        if (
-            isinstance(message, bili_msg.DanmakuMessage)
-            and "danmaku" in self.allow_message_type
-        ):
+        content = None
+        cache_key = None
+        if msg_type == "danmaku":
             content = message.content
-            cache_key = None
             if self.config["plugin_settings"]["work_mode"] == "danmaku_bot":
                 # 弹幕机器人模式：仅响应带触发前缀的弹幕，前缀不入prompt
                 prefix = self.config["plugin_settings"].get("trigger_prefix", "").strip()
@@ -956,59 +1019,36 @@ class BilibiliLive(Star):
                     self.context_rec.put_message(sender, cached, True)
                     await self._deliver_reply(cached)
                     return
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[弹幕] {message.user_name}({message.user_id})说: {content}",
-                cache_key=cache_key,
-            )
-        elif (
-            isinstance(message, bili_msg.GiftMessage)
-            and "gift" in self.allow_message_type
-        ):
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[礼物] {message.user_name}({message.user_id})赠送了{message.gift_num}个{message.gift_name}",
-            )
-        elif (
-            isinstance(message, bili_msg.SuperChatMessage)
-            and "super_chat" in self.allow_message_type
-        ):
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[醒目留言] {message.user_name}({message.user_id})说: {message.message}",
-            )
-        elif (
-            isinstance(message, bili_msg.LikeMessage)
-            and "like" in self.allow_message_type
-        ):
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[点赞] {message.user_name}({message.user_id})点赞了",
-            )
-        elif (
-            isinstance(message, bili_msg.EnterRoomMessage)
-            and "enter_room" in self.allow_message_type
-        ):
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[进入直播间] {message.user_name}({message.user_id})进入了直播间",
-            )
-        elif (
-            isinstance(message, bili_msg.GuardBuyMessage)
-            and "guard_buy" in self.allow_message_type
-        ):
-            guard_level_names = {1: "总督", 2: "提督", 3: "舰长"}
-            guard_level_name = guard_level_names.get(message.guard_level, "未知")
-            await self._send_message(
-                sender=sender,
-                sender_name=message.user_name,
-                message=f"[上舰] {message.user_name}({message.user_id})成为了{guard_level_name}",
-            )
+
+        # 攒批：非「不等待」类型的消息聚合后统一回复一条（仅弹幕机器人模式且开启攒批时）
+        if self.batch_buffer is not None and msg_type not in self._batch_no_wait_types:
+            self.batch_buffer.push(self._format_live_item(message, msg_type, content))
+            return
+
+        await self._send_message(
+            sender=sender,
+            sender_name=message.user_name,
+            message=self._format_live_item(message, msg_type, content),
+            cache_key=cache_key,
+        )
+
+    async def _batch_flush(self, items: list[str]):
+        """攒批冲刷回调：把聚合的多条直播消息一次性发给LLM，只回复一条弹幕"""
+        prompt = (
+            "直播间里接连发生了以下事件，请挑最值得接话的内容自然地回应"
+            "（只输出一条弹幕，不要逐条回应）：\n" + "\n".join(items)
+        )
+        resp = await self._send_llm_message(
+            sender=BATCH_SENDER_KEY,
+            message=prompt,
+            persona_key="live_persona_prompt",
+            rules=DANMAKU_RULES,
+        )
+        if resp is None:
+            return
+        text = self._clean_danmaku_text(resp.result_chain.get_plain_text())
+        if text:
+            await self._deliver_reply(text)
 
     async def _get_llm_provider(self):
         """获取 LLM 供应商：优先使用插件配置中指定的模型供应商，否则跟随 AstrBot 当前使用的供应商"""
@@ -1180,6 +1220,10 @@ class BilibiliLive(Star):
 
     async def terminate(self):
         """清理资源"""
+        if self.batch_buffer:
+            dropped = self.batch_buffer.reset()
+            if dropped:
+                logger.info(f"插件卸载，丢弃未冲刷的 {dropped} 条攒批消息")
         if self.comment_manager:
             await self.comment_manager.stop()
             self.comment_manager = None

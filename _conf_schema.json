@@ -321,17 +321,33 @@
           }
         }
       },
-      "random_drop": {
-        "description": "随机丢弃（测试用）",
+      "batch_reply": {
+        "description": "弹幕攒批回复（聚合多条消息后只回复一条）",
         "type": "object",
         "items": {
           "enable": {
             "description": "是否启用",
-            "type": "bool"
+            "type": "bool",
+            "default": false,
+            "hint": "仅弹幕机器人模式生效：开启后，除『不等待类型』外的直播消息先进入攒批，达到数量阈值或时间窗口后打包发给LLM，只回复一条弹幕；被攒批的消息全部计入上下文，不会丢失。替代原『随机丢弃（测试用）』。"
           },
-          "drop_rate": {
-            "description": "丢弃概率",
-            "type": "float"
+          "max_batch": {
+            "description": "数量阈值（条）",
+            "type": "int",
+            "default": 5,
+            "hint": "攒够该条数立即打包发给LLM。"
+          },
+          "max_wait": {
+            "description": "时间窗口（秒）",
+            "type": "float",
+            "default": 10.0,
+            "hint": "从最早一条攒批消息开始计时，超时强制打包（即使不足数量阈值）。"
+          },
+          "no_wait_types": {
+            "description": "不等待、立即单独处理的类型",
+            "type": "string",
+            "default": "gift,guard_buy,super_chat",
+            "hint": "以英文半角逗号分隔，可选：danmaku, gift, guard_buy, super_chat, like, enter_room。这些类型的消息绕过攒批立即单独处理（如礼物、上舰、醒目留言及时答谢）；未列入的类型参与攒批。把 danmaku 填进来即可让弹幕也完全不走攒批。"
           }
         }
       },
