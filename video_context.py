@@ -16,8 +16,8 @@ from .blivedm.clients.ws_base import USER_AGENT
 
 VIEW_API_URL = "https://api.bilibili.com/x/web-interface/view"
 
-# 降级元数据时注入的简介上限（字）
-DESC_MAX = 100
+# 注入prompt的简介上限（字）：视频信息模板与降级拼接共用
+DESC_MAX = 250
 # LLM概括的长度上限（字）
 ANALYSIS_MAX = 80
 
@@ -26,6 +26,7 @@ CONTEXT_TEMPLATE = (
     "标题：{title}\n"
     "UP主：{owner}\n"
     "分区：{tname}\n"
+    "简介：{desc}\n"
     "内容概括：{analysis}"
 )
 
@@ -70,6 +71,9 @@ class VideoContextManager:
             return None
         bvid = str(data.get("bvid") or oid)
         cached = self._cache.get(bvid)
+        if cached is not None and "desc" not in cached:
+            # 旧版缓存缺少简介字段，视为过期重新生成（每个视频仅多一次概括调用）
+            cached = None
         if cached is None:
             analysis = await self._summarize(data)
             if not analysis:
@@ -78,6 +82,7 @@ class VideoContextManager:
                 "title": data.get("title") or "",
                 "owner": (data.get("owner") or {}).get("name") or "",
                 "tname": data.get("tname") or "",
+                "desc": (data.get("desc") or "").strip()[:DESC_MAX] or "无",
                 "analysis": analysis,
             }
             self._cache[bvid] = cached

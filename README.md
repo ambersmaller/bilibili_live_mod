@@ -58,7 +58,6 @@
 注意：
 
 - 首轮轮询只建立基准、不回复历史通知，重启不重复回复；删除数据目录的 `comment_state.json`（`data/plugin_data/astrbot_plugin_bilibili_live_mod/`）可从头再来。
-- 发送成功后会校验评论是否真实可见，被风控秒删或审核中会输出警告日志（含 rpid 与链接）。
 - 「收到评论」**不含**自己视频下无人回复过的全新顶层评论。
 
 ### X账号（`account_x` 组，可选）

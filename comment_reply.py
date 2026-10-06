@@ -22,8 +22,6 @@ from .blivedm.clients.ws_base import USER_AGENT
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 REPLY_FEED_URL = "https://api.bilibili.com/x/msgfeed/reply"
 REPLY_ADD_URL = "https://api.bilibili.com/x/v2/reply/add"
-# 单条评论详情（用于发送后校验回复是否真实可见）
-REPLY_DETAIL_URL = "https://api.bilibili.com/x/v2/reply/detail"
 
 # wbi 混合密钥索引表（bilibili-API-collect wbi.md，全表64项取前32项即可）
 MIXIN_KEY_ENC_TAB = [
@@ -194,13 +192,13 @@ class BiliCommentClient:
 
     async def send_reply(
         self, oid: str, root: str, parent: str, message: str, reply_type: str = "1"
-    ) -> str | None:
+    ) -> bool:
         """发布一条视频评论回复（POST reply/add，仅需Cookie+CSRF，无需wbi）。
-        成功返回评论rpid（部分成功响应可能缺rpid，此时返回空字符串），失败返回None"""
+        成功返回True，失败返回False（不重试）"""
         csrf = _parse_cookie_str(self._get_cookie()).get("bili_jct", "")
         if not csrf:
             logger.error(f"[{self.label}] 缺少bili_jct，无法发送评论回复")
-            return None
+            return False
         data = {
             "type": reply_type,
             "oid": oid,
@@ -223,11 +221,10 @@ class BiliCommentClient:
                 result = await resp.json()
         except Exception as e:
             logger.error(f"[{self.label}] 评论回复请求异常: {e}")
-            return None
+            return False
         code = result.get("code")
         if code == 0:
-            rpid = str((result.get("data") or {}).get("rpid_str") or "")
-            return rpid
+            return True
         if code in RATE_LIMIT_CODES or code == 12015:
             logger.warning(
                 f"[{self.label}] 评论回复触发风控: code={code}, "
@@ -241,34 +238,7 @@ class BiliCommentClient:
             logger.warning(
                 f"[{self.label}] 评论回复失败: code={code}, message={result.get('message')}"
             )
-        return None
-
-    async def verify_reply(self, oid: str, rpid: str) -> bool | None:
-        """校验刚发的回复在视频下是否真实可见（被风控秒删时reply/add仍返回成功）。
-
-        返回True可见 / False不可见 / None校验请求失败（不下结论）"""
-        params = {"type": "1", "oid": oid, "root": rpid}
-        if await self._ensure_mixin_key():
-            params = self._wbi_sign(params)
-        try:
-            async with self._session.get(
-                REPLY_DETAIL_URL, params=params, headers=self._headers()
-            ) as resp:
-                result = await resp.json()
-        except Exception as e:
-            logger.debug(f"[{self.label}] 回复可见性校验请求异常: {e}")
-            return None
-        code = result.get("code")
-        if code == 0:
-            return bool((result.get("data") or {}).get("reply"))
-        if code == 12002:
-            # 评论不存在：确认被删
-            return False
-        logger.debug(
-            f"[{self.label}] 回复可见性校验失败: code={code}, "
-            f"message={result.get('message')}"
-        )
-        return None
+        return False
 
 
 class CommentReplyManager:
@@ -550,31 +520,18 @@ class CommentReplyManager:
         while True:
             req = await self._reply_queue.get()
             try:
-                rpid = await self._y_client.send_reply(
+                if await self._y_client.send_reply(
                     req["oid"], req["root"], req["parent"], req["message"], req["rtype"]
-                )
-                if rpid is not None:
+                ):
                     prefix = (
                         "已回复X账号视频" if req["source_account"] == "X" else "已回复视频"
                     )
-                    if rpid:
-                        # reply/add返回成功不代表评论真的可见（风控秒删仍返回成功），需校验
-                        visible = await self._y_client.verify_reply(req["oid"], rpid)
-                        if visible is False:
-                            logger.warning(
-                                f"回复发送成功但视频下不可见（疑似被风控秒删或审核中）: "
-                                f"{prefix}av{req['oid']} rpid={rpid}，"
-                                f"内容: {req['message'][:30]}，可访问 "
-                                f"https://www.bilibili.com/video/av{req['oid']}/#reply{rpid} 确认"
-                            )
-                            continue
-                    # 楼中楼回复（root≠parent）发送可见后才累加楼层深度计数，直接评论不计
+                    # 楼中楼回复（root≠parent）发送成功后累加楼层深度计数，直接评论不计
                     if req["root"] != req["parent"]:
                         self._bump_thread_replies(req["root"])
                     logger.info(
                         f"{prefix}av{req['oid']}下{req['nickname']}的评论: "
                         f"{req['message'][:30]}"
-                        + (f" (rpid={rpid})" if rpid else "")
                     )
             except asyncio.CancelledError:
                 raise
