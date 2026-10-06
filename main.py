@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -73,6 +74,53 @@ X25KN_X_URL = "https://live-trace.bilibili.com/xlive/data-interface/v1/x25Kn/X"
 X25KN_HMAC_FUNCS = ["md5", "sha1", "sha256", "sha224", "sha512", "sha384"]
 
 
+def _strip_leading_quote(text: str, nickname: str, content: str) -> str:
+    """剥离回复开头复读输入的引文段，只保留真正的回复。
+
+    模型常把输入行（"昵称说: 内容"、"用户[昵称]发表评论：内容"等变体）当作引文
+    缀在回复开头，如 "飘局座说: 内容 哈哈是啊..."。判据：回复开头完整重复了
+    评论内容，且内容前的署名段很短、并以 "说/回复/评论/发表" 等署名词收尾。
+    剥后为空说明是纯复读，由上层丢弃；无法确认则原样返回。
+    """
+    norm_content = " ".join(content.split())
+    norm_text = " ".join(text.split())
+    if not norm_content:
+        return text
+    pos = norm_text.find(norm_content)
+    if pos < 0:
+        return text
+    prefix = norm_text[:pos]
+    if prefix:
+        # 署名段：短，且以署名词（可带冒号/引号）收尾；"前面说得好"这类
+        # 正文不因含"说"字被误剥
+        is_attribution = len(prefix) <= len(nickname) + 24 and (
+            re.search(r"(?:说道|发表评论|发表|回复|评论|说)[:：]?[\s\"'“”]*$", prefix)
+            is not None
+        )
+    else:
+        is_attribution = True
+    if not is_attribution:
+        return text
+    rest = norm_text[pos + len(norm_content):]
+    return rest.strip(" \t:：,，。.!！?？~～\"'“”")
+
+
+def _make_comment_echo_cleaner(prompt_text: str):
+    """从评论区提示词中提取昵称与评论内容，构造回复清理函数（剥离开头引文复读）。
+    提示词格式不识别时返回 None（不清理）"""
+    m = re.search(
+        r"\[视频评论\] (.{1,64}?)\((.{1,32}?)\)说: (.*)", prompt_text, re.DOTALL
+    )
+    if not m:
+        return None
+    nickname, content = m.group(1), m.group(3)
+
+    def clean(text: str) -> str:
+        return _strip_leading_quote(text, nickname, content)
+
+    return clean
+
+
 class LlmChatService:
     """LLM 回复生成服务：弹幕与评论两条路径显式分离。
 
@@ -109,18 +157,28 @@ class LlmChatService:
             self._locks[sender] = asyncio.Lock()
         return self._locks[sender]
 
-    async def gen_live_reply(self, sender: str, message: str):
-        """直播间弹幕的 LLM 回复生成。返回 LLMResponse，None 表示不回复"""
+    async def gen_live_reply(self, sender: str, message: str) -> str | None:
+        """直播间弹幕的 LLM 回复生成。返回回复文本，None 表示不回复"""
         persona = self._settings.get("live_persona_prompt", "").strip()
         return await self._chat(
             sender, message, persona, DANMAKU_RULES, self.live_record
         )
 
-    async def gen_comment_reply(self, sender: str, message: str):
-        """视频评论区的 LLM 回复生成。返回 LLMResponse，None 表示不回复"""
+    async def gen_comment_reply(
+        self, sender: str, message: str, clean=None
+    ) -> str | None:
+        """视频评论区的 LLM 回复生成。返回回复文本，None 表示不回复。
+
+        clean: 可选的回复清理函数（如剥离开头引文复读）；清理后的文本才计入
+        上下文并返回，避免复读模式被记进历史后自我强化"""
         persona = self._settings.get("comment_persona_prompt", "").strip()
         return await self._chat(
-            sender, message, persona, COMMENT_RULES, self.comment_record
+            sender,
+            message,
+            persona,
+            COMMENT_RULES,
+            self.comment_record,
+            clean=clean,
         )
 
     async def record_live_cached(self, sender: str, prompt_text: str, cached: str):
@@ -129,8 +187,11 @@ class LlmChatService:
             self.live_record.put_message(sender, prompt_text, False)
             self.live_record.put_message(sender, cached, True)
 
-    async def _chat(self, sender: str, message: str, persona: str, rules: str, record):
-        """调用 LLM 并更新上下文（同一发送者的调用与写入串行化）"""
+    async def _chat(
+        self, sender: str, message: str, persona: str, rules: str, record, clean=None
+    ) -> str | None:
+        """调用 LLM 并更新上下文（同一发送者的调用与写入串行化）。
+        返回回复文本（clean 清理后的版本），None 表示不回复"""
         guard = self._guard
         if guard is not None and not guard.allow():
             logger.debug("LLM 熔断冷却中，本次调用跳过")
@@ -165,13 +226,20 @@ class LlmChatService:
                 return None
             if guard is not None:
                 guard.record_success()
+            reply_text = resp.result_chain.get_plain_text()
+            if clean is not None:
+                reply_text = clean(reply_text)
+            if not reply_text.strip():
+                # 空回复或纯复读（被清理为空）：不计入上下文，
+                # 避免留下悬空的用户消息诱发后续复读
+                return None
             record.put_message(sender, message, False)
-            record.put_message(sender, resp.result_chain.get_plain_text(), True)
+            record.put_message(sender, reply_text, True)
             logger.debug(f"LLM Context: {record.get_messages(sender)}")
-            return resp
+            return reply_text
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.6.0")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.6.1")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -867,15 +935,14 @@ class BilibiliLive(Star):
     ) -> str | None:
         """评论区新评论的LLM回复生成：按视频(oid)+楼层(root_id)维护上下文，使用评论区人设。
         楼中楼评论按楼层独立记忆，避免不同楼层对话互相串味；直接评论仍按视频共享记忆。
-        返回原始回复文本（清理与截断由CommentReplyManager负责），None表示不回复"""
+        返回回复文本（开头引文复读已被剥离；截断与发送前校验由CommentReplyManager负责），
+        None表示不回复"""
         thread = f"_r{root_id}" if root_id not in ("", "0") else ""
-        resp = await self.llm_chat.gen_comment_reply(
+        return await self.llm_chat.gen_comment_reply(
             sender=f"comment_av{oid}{thread}",
             message=prompt_text,
+            clean=_make_comment_echo_cleaner(prompt_text),
         )
-        if resp is None:
-            return None
-        return resp.result_chain.get_plain_text()
 
     async def _get_video_context(self, oid: str) -> str | None:
         """评论区回复前的视频内容识别：懒加载管理器，元数据概括按视频缓存，
@@ -1126,10 +1193,10 @@ class BilibiliLive(Star):
             "直播间里接连发生了以下事件，请挑最值得接话的内容自然地回应"
             "（只输出一条弹幕，不要逐条回应）：\n" + "\n".join(items)
         )
-        resp = await self.llm_chat.gen_live_reply(BATCH_SENDER_KEY, prompt)
-        if resp is None:
+        resp_text = await self.llm_chat.gen_live_reply(BATCH_SENDER_KEY, prompt)
+        if resp_text is None:
             return
-        text = self._clean_danmaku_text(resp.result_chain.get_plain_text())
+        text = self._clean_danmaku_text(resp_text)
         if text:
             await self._deliver_reply(text)
 
@@ -1190,10 +1257,10 @@ class BilibiliLive(Star):
 
         if work_mode == "danmaku_bot":
             # 弹幕机器人：LLM回复以弹幕形式发回直播间
-            resp = await self.llm_chat.gen_live_reply(sender, message)
-            if resp is None:
+            resp_text = await self.llm_chat.gen_live_reply(sender, message)
+            if resp_text is None:
                 return
-            text = self._clean_danmaku_text(resp.result_chain.get_plain_text())
+            text = self._clean_danmaku_text(resp_text)
             if not text:
                 return
             if cache_key is not None:
@@ -1203,24 +1270,26 @@ class BilibiliLive(Star):
             for dest in self.config["plugin_settings"]["forward_destinations"]:
                 await self.context.send_message(dest, MessageChain([Plain(message)]))
         elif work_mode == "llm_chat_forward":
-            resp = await self.llm_chat.gen_live_reply(sender, message)
-            if resp is None:
+            resp_text = await self.llm_chat.gen_live_reply(sender, message)
+            if resp_text is None:
                 return
             for dest in self.config["plugin_settings"]["forward_destinations"]:
-                await self.context.send_message(dest, resp.result_chain)
+                await self.context.send_message(dest, MessageChain([Plain(resp_text)]))
         elif work_mode == "llm_chat_callback":
             method = self.config["plugin_settings"]["llm_chat_callback"][
                 "callback_method"
             ]
             url = self.config["plugin_settings"]["llm_chat_callback"]["callback_url"]
-            resp = await self.llm_chat.gen_live_reply(sender, message)
+            resp_text = await self.llm_chat.gen_live_reply(sender, message)
+            if resp_text is None:
+                return
 
             async with aiohttp.ClientSession() as session:
                 if method == "GET":
                     params = {
                         "sender": sender,
                         "sender_name": sender_name,
-                        "message": resp.result_chain.get_plain_text(),
+                        "message": resp_text,
                     }
                     async with session.get(url, params=params) as resp:
                         if resp.status != 200:
@@ -1233,7 +1302,7 @@ class BilibiliLive(Star):
                         json={
                             "sender": sender,
                             "sender_name": sender_name,
-                            "message": resp.result_chain.get_plain_text(),
+                            "message": resp_text,
                         },
                     ) as resp:
                         if resp.status != 200:
