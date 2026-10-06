@@ -1,14 +1,13 @@
 class ContextRecord:
-    """上下文记录器"""
+    """上下文记录器（普通类，每次构造都是独立实例）
 
-    _instance = None
+    按发送者键维护短期对话记忆；get_messages 返回拷贝，
+    调用方（含 LLM provider）拿到的不是内部活引用，避免被外部改写。
+    """
 
-    def __new__(cls, max_messages: int = 15):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance.max_messages = max_messages * 2
-            cls._instance.message_dict = {}
-        return cls._instance
+    def __init__(self, max_messages: int = 15):
+        self.max_messages = max_messages * 2
+        self.message_dict = {}
 
     def put_message(self, sender: str, message: str, is_ai: bool):
         """插入消息"""
@@ -23,5 +22,5 @@ class ContextRecord:
         )
 
     def get_messages(self, sender: str) -> list[dict]:
-        """获取消息"""
-        return self.message_dict.get(sender, [])
+        """获取消息（返回拷贝，防止外部就地修改内部记录）"""
+        return [dict(m) for m in self.message_dict.get(sender, [])]

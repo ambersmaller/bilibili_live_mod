@@ -73,7 +73,105 @@ X25KN_X_URL = "https://live-trace.bilibili.com/xlive/data-interface/v1/x25Kn/X"
 X25KN_HMAC_FUNCS = ["md5", "sha1", "sha256", "sha224", "sha512", "sha384"]
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.5.0")
+class LlmChatService:
+    """LLM 回复生成服务：弹幕与评论两条路径显式分离。
+
+    - 各自持有独立的上下文记录器（窗口分别由 llm_chat_max_context /
+      comment_context_rounds 控制）与独立的人设/规则，互不影响；
+    - 同一发送者的 LLM 调用与上下文写入由 per-key 锁串行化，
+      防止并发任务（如 X/Y 双轮询命中同一楼层）相互污染上下文快照
+      （此前表现为模型偶发复读输入行、同一评论被回复两次）；
+    - 熔断计数复用宿主的 FailureGuard。
+    """
+
+    def __init__(self, settings: dict, provider_getter, guard: FailureGuard | None):
+        """
+        :param settings: 插件设置（plugin_settings 配置段）
+        :param provider_getter: async () -> provider | None，获取当前模型供应商
+        :param guard: FailureGuard 熔断守卫（None 表示未启用）
+        """
+        self._settings = settings
+        self._get_provider = provider_getter
+        self._guard = guard
+        # 弹幕上下文：短窗口（弹幕场景建议3~5轮）
+        self.live_record = ContextRecord(
+            max_messages=settings["llm_chat_max_context"]
+        )
+        # 评论区上下文：独立小窗口（评论区prompt带注入的楼层上下文行）
+        self.comment_record = ContextRecord(
+            max_messages=int(settings.get("comment_context_rounds") or 8)
+        )
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, sender: str) -> asyncio.Lock:
+        """取发送者键对应的串行化锁（单事件循环内惰性创建）"""
+        if sender not in self._locks:
+            self._locks[sender] = asyncio.Lock()
+        return self._locks[sender]
+
+    async def gen_live_reply(self, sender: str, message: str):
+        """直播间弹幕的 LLM 回复生成。返回 LLMResponse，None 表示不回复"""
+        persona = self._settings.get("live_persona_prompt", "").strip()
+        return await self._chat(
+            sender, message, persona, DANMAKU_RULES, self.live_record
+        )
+
+    async def gen_comment_reply(self, sender: str, message: str):
+        """视频评论区的 LLM 回复生成。返回 LLMResponse，None 表示不回复"""
+        persona = self._settings.get("comment_persona_prompt", "").strip()
+        return await self._chat(
+            sender, message, persona, COMMENT_RULES, self.comment_record
+        )
+
+    async def record_live_cached(self, sender: str, prompt_text: str, cached: str):
+        """弹幕回复缓存命中时：把该次问答计入弹幕上下文（与生成路径同锁）"""
+        async with self._lock_for(sender):
+            self.live_record.put_message(sender, prompt_text, False)
+            self.live_record.put_message(sender, cached, True)
+
+    async def _chat(self, sender: str, message: str, persona: str, rules: str, record):
+        """调用 LLM 并更新上下文（同一发送者的调用与写入串行化）"""
+        guard = self._guard
+        if guard is not None and not guard.allow():
+            logger.debug("LLM 熔断冷却中，本次调用跳过")
+            return None
+        provider = await self._get_provider()
+        if provider is None:
+            logger.error(
+                "没有可用的模型供应商（LLM），"
+                "请检查 AstrBot 的模型供应商配置，或在插件配置中指定 llm_provider_id"
+            )
+            if guard is not None:
+                guard.record_failure()
+            return None
+        system_prompt = f"{persona}\n\n{rules}" if persona else rules
+        async with self._lock_for(sender):
+            try:
+                resp = await provider.text_chat(
+                    prompt=message,
+                    session_id=None,
+                    contexts=record.get_messages(sender),
+                    system_prompt=system_prompt,
+                )
+            except Exception:
+                # 异常/超时计入连续失败；重新抛出保持原有逐条容错行为
+                if guard is not None:
+                    guard.record_failure()
+                raise
+            if resp is None or resp.result_chain is None:
+                logger.warning("LLM 返回了空响应，本次消息跳过")
+                if guard is not None:
+                    guard.record_failure()
+                return None
+            if guard is not None:
+                guard.record_success()
+            record.put_message(sender, message, False)
+            record.put_message(sender, resp.result_chain.get_plain_text(), True)
+            logger.debug(f"LLM Context: {record.get_messages(sender)}")
+            return resp
+
+
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.6.0")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -89,13 +187,26 @@ class BilibiliLive(Star):
                 config["blivedm_open_live"]["app_id"],
                 config["blivedm_open_live"]["room_owner_auth_code"],
             )
-        self.context_rec = ContextRecord(
-            max_messages=config["plugin_settings"]["llm_chat_max_context"]
+        # LLM连续失败守卫：单供应商单入口，连续失败N次后冷却跳过，
+        # 到期以真实请求探测恢复（None 表示未启用）
+        # 注意：需在 llm_chat 之前创建，LlmChatService 依赖它做熔断计数
+        breaker_conf = (
+            self.config.get("plugin_settings", {}).get("llm_breaker", {}) or {}
         )
-        # 评论区独立的上下文记录器：窗口大小与弹幕分开配置
-        # （评论区prompt带注入的楼层上下文行，合理窗口应比弹幕小）
-        self.comment_context_rec = ContextRecord(
-            max_messages=int(config["plugin_settings"].get("comment_context_rounds") or 8)
+        if breaker_conf.get("enable", True):
+            self._llm_guard = FailureGuard(
+                threshold=int(breaker_conf.get("threshold") or 3),
+                cooldown=float(breaker_conf.get("cooldown") or 120),
+                name="LLM",
+            )
+        else:
+            self._llm_guard: FailureGuard | None = None
+        # LLM 回复生成统一走 LlmChatService：弹幕/评论两条路径显式分离，
+        # 各自持有独立的上下文记录器与人设规则
+        self.llm_chat = LlmChatService(
+            config["plugin_settings"],
+            provider_getter=self._get_llm_provider,
+            guard=self._llm_guard,
         )
         self.allow_message_type = {
             item.strip().lower()
@@ -105,11 +216,6 @@ class BilibiliLive(Star):
         batch_conf = (
             self.config.get("plugin_settings", {}).get("batch_reply", {}) or {}
         )
-        self._batch_no_wait_types = {
-            t.strip().lower()
-            for t in str(batch_conf.get("no_wait_types") or "").split(",")
-            if t.strip()
-        }
         self.batch_buffer: BatchBuffer | None = None
         if (
             self.config["plugin_settings"].get("work_mode") == "danmaku_bot"
@@ -122,8 +228,7 @@ class BilibiliLive(Star):
             )
             logger.info(
                 f"弹幕攒批回复已启用：攒够 {batch_conf.get('max_batch') or 5} 条"
-                f"或等待 {batch_conf.get('max_wait') or 10.0} 秒即打包回复一条；"
-                f"不等待类型: {sorted(self._batch_no_wait_types) or '无'}"
+                f"或等待 {batch_conf.get('max_wait') or 10.0} 秒即打包回复一条"
             )
         self._process_task: asyncio.Task | None = None
         self._live_monitor_task: asyncio.Task | None = None
@@ -144,19 +249,6 @@ class BilibiliLive(Star):
         self.comment_manager: CommentReplyManager | None = None
         # 视频内容识别器（评论区回复用：元数据→一句话概括→按视频缓存）
         self._video_ctx_manager: VideoContextManager | None = None
-        # LLM连续失败守卫：单供应商单入口，连续失败N次后冷却跳过，
-        # 到期以真实请求探测恢复（None 表示未启用）
-        breaker_conf = (
-            self.config.get("plugin_settings", {}).get("llm_breaker", {}) or {}
-        )
-        if breaker_conf.get("enable", True):
-            self._llm_guard = FailureGuard(
-                threshold=int(breaker_conf.get("threshold") or 3),
-                cooldown=float(breaker_conf.get("cooldown") or 120),
-                name="LLM",
-            )
-        else:
-            self._llm_guard: FailureGuard | None = None
 
     def _get_cookie_str(self) -> str:
         """从配置中的三个 cookie 字段拼接 cookie 字符串（跳过空值）"""
@@ -777,12 +869,9 @@ class BilibiliLive(Star):
         楼中楼评论按楼层独立记忆，避免不同楼层对话互相串味；直接评论仍按视频共享记忆。
         返回原始回复文本（清理与截断由CommentReplyManager负责），None表示不回复"""
         thread = f"_r{root_id}" if root_id not in ("", "0") else ""
-        resp = await self._send_llm_message(
+        resp = await self.llm_chat.gen_comment_reply(
             sender=f"comment_av{oid}{thread}",
             message=prompt_text,
-            persona_key="comment_persona_prompt",
-            rules=COMMENT_RULES,
-            record=self.comment_context_rec,
         )
         if resp is None:
             return None
@@ -1015,13 +1104,12 @@ class BilibiliLive(Star):
                     prompt_text = (
                         f"[弹幕] {message.user_name}({message.user_id})说: {content}"
                     )
-                    self.context_rec.put_message(sender, prompt_text, False)
-                    self.context_rec.put_message(sender, cached, True)
+                    await self.llm_chat.record_live_cached(sender, prompt_text, cached)
                     await self._deliver_reply(cached)
                     return
 
-        # 攒批：非「不等待」类型的消息聚合后统一回复一条（仅弹幕机器人模式且开启攒批时）
-        if self.batch_buffer is not None and msg_type not in self._batch_no_wait_types:
+        # 攒批：消息聚合后统一回复一条（仅弹幕机器人模式且开启攒批时）
+        if self.batch_buffer is not None:
             self.batch_buffer.push(self._format_live_item(message, msg_type, content))
             return
 
@@ -1038,12 +1126,7 @@ class BilibiliLive(Star):
             "直播间里接连发生了以下事件，请挑最值得接话的内容自然地回应"
             "（只输出一条弹幕，不要逐条回应）：\n" + "\n".join(items)
         )
-        resp = await self._send_llm_message(
-            sender=BATCH_SENDER_KEY,
-            message=prompt,
-            persona_key="live_persona_prompt",
-            rules=DANMAKU_RULES,
-        )
+        resp = await self.llm_chat.gen_live_reply(BATCH_SENDER_KEY, prompt)
         if resp is None:
             return
         text = self._clean_danmaku_text(resp.result_chain.get_plain_text())
@@ -1064,60 +1147,6 @@ class BilibiliLive(Star):
                 "已回退到 AstrBot 当前使用的供应商"
             )
         return await self.context.get_using_provider_async()
-
-    def _build_system_prompt(self, persona: str, rules: str) -> str:
-        """构造 system prompt：用户人设（可配置）+ 内置输出规则"""
-        if persona:
-            return f"{persona}\n\n{rules}"
-        return rules
-
-    async def _send_llm_message(
-        self,
-        sender: str,
-        message: str,
-        persona_key: str,
-        rules: str,
-        record: ContextRecord | None = None,
-    ):
-        """处理LLM聊天并更新上下文。persona_key 为配置中的人设字段名；
-        record 指定上下文记录器（默认弹幕用的 context_rec，评论区传 comment_context_rec）"""
-        if self._llm_guard is not None and not self._llm_guard.allow():
-            logger.debug("LLM 熔断冷却中，本次调用跳过")
-            return None
-        provider = await self._get_llm_provider()
-        if provider is None:
-            logger.error(
-                "没有可用的模型供应商（LLM），"
-                "请检查 AstrBot 的模型供应商配置，或在插件配置中指定 llm_provider_id"
-            )
-            if self._llm_guard is not None:
-                self._llm_guard.record_failure()
-            return None
-        rec = record if record is not None else self.context_rec
-        persona = self.config["plugin_settings"].get(persona_key, "").strip()
-        try:
-            resp = await provider.text_chat(
-                prompt=message,
-                session_id=None,
-                contexts=rec.get_messages(sender),
-                system_prompt=self._build_system_prompt(persona, rules),
-            )
-        except Exception:
-            # 异常/超时计入连续失败；重新抛出保持原有逐条容错行为
-            if self._llm_guard is not None:
-                self._llm_guard.record_failure()
-            raise
-        if resp is None or resp.result_chain is None:
-            logger.warning("LLM 返回了空响应，本次消息跳过")
-            if self._llm_guard is not None:
-                self._llm_guard.record_failure()
-            return None
-        if self._llm_guard is not None:
-            self._llm_guard.record_success()
-        rec.put_message(sender, message, False)
-        rec.put_message(sender, resp.result_chain.get_plain_text(), True)
-        logger.debug(f"LLM Context: {rec.get_messages(sender)}")
-        return resp
 
     def _clean_danmaku_text(self, text: str) -> str:
         """把LLM回复清理成可发送的弹幕：换行/连续空白压成单空格，超长截断"""
@@ -1161,9 +1190,7 @@ class BilibiliLive(Star):
 
         if work_mode == "danmaku_bot":
             # 弹幕机器人：LLM回复以弹幕形式发回直播间
-            resp = await self._send_llm_message(
-                sender, message, "live_persona_prompt", DANMAKU_RULES
-            )
+            resp = await self.llm_chat.gen_live_reply(sender, message)
             if resp is None:
                 return
             text = self._clean_danmaku_text(resp.result_chain.get_plain_text())
@@ -1176,9 +1203,7 @@ class BilibiliLive(Star):
             for dest in self.config["plugin_settings"]["forward_destinations"]:
                 await self.context.send_message(dest, MessageChain([Plain(message)]))
         elif work_mode == "llm_chat_forward":
-            resp = await self._send_llm_message(
-                sender, message, "live_persona_prompt", DANMAKU_RULES
-            )
+            resp = await self.llm_chat.gen_live_reply(sender, message)
             if resp is None:
                 return
             for dest in self.config["plugin_settings"]["forward_destinations"]:
@@ -1188,9 +1213,7 @@ class BilibiliLive(Star):
                 "callback_method"
             ]
             url = self.config["plugin_settings"]["llm_chat_callback"]["callback_url"]
-            resp = await self._send_llm_message(
-                sender, message, "live_persona_prompt", DANMAKU_RULES
-            )
+            resp = await self.llm_chat.gen_live_reply(sender, message)
 
             async with aiohttp.ClientSession() as session:
                 if method == "GET":

@@ -1,7 +1,7 @@
 name: astrbot_plugin_bilibili_live_mod
 display_name: B站回复机器人
 desc: B站回复机器人：视频、直播间的AI回复助手。采用双账号制。
-version: 2.5.0
+version: 2.6.0
 author: ambersmaller
 repo: https://github.com/ambersmaller/bilibili_live_mod
 tags:
