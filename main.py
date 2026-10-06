@@ -239,7 +239,7 @@ class LlmChatService:
             return reply_text
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.6.2")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "2.6.3")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -933,13 +933,15 @@ class BilibiliLive(Star):
     async def _comment_reply_handler(
         self, account_label: str, prompt_text: str, oid: str, root_id: str
     ) -> str | None:
-        """评论区新评论的LLM回复生成：按视频(oid)+楼层(root_id)维护上下文，使用评论区人设。
+        """评论区新评论的LLM回复生成：按账号+视频(oid)+楼层(root_id)维护上下文，
+        使用评论区人设。X/Y两账号的通知即使指向同一视频同一楼层，上下文也彼此隔离，
+        杜绝"串台"（此前键中缺账号维度，双账号同楼层/联合投稿视频会直接评论时互相污染）；
         楼中楼评论按楼层独立记忆，避免不同楼层对话互相串味；直接评论仍按视频共享记忆。
         返回回复文本（开头引文复读已被剥离；截断与发送前校验由CommentReplyManager负责），
         None表示不回复"""
         thread = f"_r{root_id}" if root_id not in ("", "0") else ""
         return await self.llm_chat.gen_comment_reply(
-            sender=f"comment_av{oid}{thread}",
+            sender=f"comment_{account_label}_av{oid}{thread}",
             message=prompt_text,
             clean=_make_comment_echo_cleaner(prompt_text),
         )
