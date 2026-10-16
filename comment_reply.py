@@ -418,9 +418,9 @@ class CommentReplyManager:
         """
         :param on_reply_needed: async (account_label, prompt_text, oid, root_id, route)
             -> tuple[str | None, bool]，由宿主完成LLM回复生成（人设取自route），
-            返回（正文，是否at）；正文None涵盖"不回复"与"被拦截取消"两种情形，
-            manager 无需区分。root_id为评论所在楼层的根评论id（"0"表示对视频的
-            直接评论），供宿主按楼层维护上下文
+            返回（正文，是否at）；正文None涵盖"不回复"与"JSON解析失败取消"两种
+            情形，manager 无需区分。root_id为评论所在楼层的根评论id（"0"表示对
+            视频的直接评论），供宿主按楼层维护上下文
         :param get_video_context: async (oid) -> str | None，由宿主识别评论所属视频
             内容（【当前视频信息】文本），置于prompt最前；None表示不识别
         :param poll_gate: 可选的同步门控 callable，返回False时跳过本轮轮询

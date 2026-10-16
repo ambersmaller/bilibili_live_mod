@@ -185,14 +185,6 @@ def _parse_at_reply_json(raw: str) -> tuple[bool, str] | None:
     return obj.get("at") is True, reply
 
 
-def _has_markdown_feature(text: str) -> bool:
-    """检测回复中的 markdown 特征：代码围栏、加粗、行首标题、链接
-    （D6：不含引号检测——B站评论引用台词、玩梗用引号是正常表达）"""
-    if "```" in text or "**" in text or "](" in text:
-        return True
-    return any(line.startswith("# ") for line in text.splitlines())
-
-
 class LlmChatService:
     """LLM 回复生成服务：弹幕与评论两条路径显式分离。
 
@@ -239,18 +231,17 @@ class LlmChatService:
         return text
 
     async def gen_comment_reply(
-        self, sender: str, message: str, route=None, postprocess=None, format_guard=None
+        self, sender: str, message: str, route=None, postprocess=None
     ) -> tuple[str | None, bool]:
         """视频评论区的 LLM 回复生成。返回 (回复文本, 是否at)；
-        文本 None 表示不回复（含LLM失败、空回复、纯复读与被格式拦截取消）。
+        文本 None 表示不回复（含LLM失败、空回复、纯复读与JSON解析失败取消）。
 
         route: 路由对象（人设 + at 配置，见 comment_reply.Route）；为 None 或
         人设为空时回退默认评论区人设。at 开启时切换输出规则变体并在
         system prompt 末尾追加 at 协议块（D2/D3），LLM 以 JSON 输出，
-        由 postprocess 解析出 (正文, 是否at)。
-        postprocess: (raw) -> (正文, 是否at, 格式是否合规)，由宿主构造
-        （JSON 解析 + 引文清洗）；format_guard: (text) -> 命中规则名 | None，
-        格式拦截回调，None 表示拦截关闭（调试逃生门）"""
+        由 postprocess 解析出 (正文, 是否at)；JSON 解析失败时取消该条回复。
+        postprocess: (raw) -> (正文, 是否at, 解析是否成功)，由宿主构造
+        （JSON 解析 + 引文清洗）"""
         if route is not None and route.persona:
             persona = route.persona
         else:
@@ -266,7 +257,6 @@ class LlmChatService:
             rules,
             self.comment_record,
             postprocess=postprocess,
-            format_guard=format_guard,
         )
 
     @staticmethod
@@ -298,16 +288,14 @@ class LlmChatService:
         rules: str,
         record,
         postprocess=None,
-        format_guard=None,
     ) -> tuple[str | None, bool]:
         """调用 LLM 并更新上下文（同一发送者的调用与写入串行化）。
         返回 (回复文本, 是否at)；文本 None 表示不回复。
 
-        postprocess: (raw) -> (正文, 是否at, 格式是否合规)，取代旧的 clean 参数
+        postprocess: (raw) -> (正文, 是否at, 解析是否成功)，取代旧的 clean 参数
         （评论路径是 clean 的唯一使用者，弹幕路径不传，行为完全不变）；
-        format_guard: (text) -> 命中规则名 | None 的格式拦截回调（命名刻意与
-        熔断守卫 self._guard 区分）。拦截在上下文写入之前执行（顺序约束1）：
-        被取消的回复不写上下文、不计熔断失败（D5），日志由宿主闭包输出"""
+        解析失败（仅 at 路由 JSON 解析失败会置位）时取消该条回复：
+        不写上下文、不计熔断失败，取消日志由宿主闭包输出"""
         guard = self._guard
         if guard is not None and not guard.allow():
             logger.debug("LLM 熔断冷却中，本次调用跳过")
@@ -348,16 +336,9 @@ class LlmChatService:
             else:
                 text, at_flag, ok = raw, False, True
             if not ok:
-                if format_guard is None:
-                    # 拦截总开关关闭（调试逃生门）：剥围栏原文照发、不at
-                    at_flag = False
-                else:
-                    # 默认策略（D5）：取消回复，不写上下文、不计熔断失败
-                    return None, False
-            elif format_guard is not None:
-                reason = format_guard(text)
-                if reason:
-                    return None, False
+                # at 路由 JSON 解析失败：取消该条回复，
+                # 不写上下文、不计熔断失败（取消日志由宿主闭包输出）
+                return None, False
             if not text.strip():
                 # 空回复或纯复读（被清理为空）：不计入上下文，
                 # 避免留下悬空的用户消息诱发后续复读
@@ -368,7 +349,7 @@ class LlmChatService:
             return text, at_flag
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.0.0")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.1.0")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -409,6 +390,18 @@ class BilibiliLive(Star):
             item.strip().lower()
             for item in self.config["plugin_settings"]["allow_message_type"].split(",")
         }
+        # 工作模式校验：llm_chat_callback 已移除，存量配置指向该值时仅告警、
+        # 不自动改写（避免静默变更用户设置；回退到 danmaku_bot 可能意外发弹幕）
+        if self.config["plugin_settings"].get("work_mode") not in (
+            "danmaku_bot",
+            "forward_only",
+            "llm_chat_forward",
+        ):
+            logger.warning(
+                f"工作模式 '{self.config['plugin_settings'].get('work_mode')}' 无效"
+                "（『LLM聊天回调』功能已移除），插件将不响应任何消息，"
+                "请在插件配置中改回 danmaku_bot 或其他有效模式"
+            )
         # 弹幕攒批回复：聚合多条直播消息后打包发给LLM，只回复一条（仅弹幕机器人模式启用）
         batch_conf = (
             self.config.get("plugin_settings", {}).get("batch_reply", {}) or {}
@@ -446,9 +439,6 @@ class BilibiliLive(Star):
         self.comment_manager: CommentReplyManager | None = None
         # 视频内容识别器（评论区回复用：元数据→一句话概括→按视频缓存）
         self._video_ctx_manager: VideoContextManager | None = None
-        # 回复格式拦截的滑动一小时计数（防静默吞回复：累计≥3条升级error；仅内存不落盘）
-        self._intercept_times: list[float] = []
-        self._intercept_error_at: float = 0.0
 
     def _get_cookie_str(self) -> str:
         """从配置中的三个 cookie 字段拼接 cookie 字符串（跳过空值）"""
@@ -1207,24 +1197,6 @@ class BilibiliLive(Star):
             "at_guide": str(d.get("at_guide") or "").strip(),
         }
 
-    def _record_intercept(self, account_label: str, oid: str, reason: str, text: str):
-        """记录一次回复格式拦截：info 日志留痕 + 滑动一小时计数，累计 ≥3 条时
-        升级一条 error 告警（防静默吞回复；口径为滑动一小时累计而非连续，
-        仅内存计数、重启清零）。拦截不计入熔断失败数、不写上下文记录（D5）"""
-        now = time.time()
-        self._intercept_times.append(now)
-        self._intercept_times = [t for t in self._intercept_times if now - t < 3600]
-        logger.info(
-            f"[拦截] 账号={account_label} av{oid} 原因={reason} 原文前30字={text[:30]}"
-        )
-        if len(self._intercept_times) >= 3 and now - self._intercept_error_at > 3600:
-            self._intercept_error_at = now
-            logger.error(
-                "一小时内已累计拦截≥3条评论回复（格式异常被取消发送，未计入熔断）。"
-                "请检查所用模型的格式遵守度与提示词模板；确认需要临时排查时可关闭"
-                "『回复格式拦截』总开关（调试逃生门，正常运营不应关闭）"
-            )
-
     async def _comment_reply_handler(
         self, account_label: str, prompt_text: str, oid: str, root_id: str, route: Route
     ) -> tuple[str | None, bool]:
@@ -1232,48 +1204,26 @@ class BilibiliLive(Star):
         人设取自路由（route.persona，默认路由即评论区默认人设）。X/Y两账号的
         通知即使指向同一视频同一楼层，上下文也彼此隔离，杜绝"串台"（见
         CHANGELOG 2.6.3）；楼中楼评论按楼层独立记忆，直接评论按视频共享记忆。
-        at 路由时 LLM 以 JSON 输出由 postprocess 解析；格式拦截由 format_guard
-        闭包执行（JSON 解析与格式规则都定义在宿主侧，manager 不感知格式细节，
-        闭包持有账号/视频便于日志定位）。返回 (回复文本, 是否at)；文本 None
-        涵盖"不回复"与"被拦截取消"两种情形。截断与复读校验由
+        at 路由时 LLM 以 JSON 输出由 postprocess 解析（JSON 解析与引文清洗
+        都定义在宿主侧，manager 不感知格式细节，闭包持有账号/视频便于日志
+        定位）；JSON 解析失败时取消该条回复。返回 (回复文本, 是否at)；文本
+        None 涵盖"不回复"与"JSON解析失败取消"两种情形。截断与复读校验由
         CommentReplyManager 负责（维持现状位置）"""
         thread = f"_r{root_id}" if root_id not in ("", "0") else ""
         clean = _make_comment_echo_cleaner(prompt_text)
-        guard_conf = (
-            (self.config.get("comment_reply", {}) or {}).get("reply_guard", {}) or {}
-        )
-        format_guard = None
-        if guard_conf.get("enable", True):
-            cancel_on_at = bool(guard_conf.get("cancel_on_at_sign", True))
-            cancel_on_md = bool(guard_conf.get("cancel_on_markdown", True))
-
-            def format_guard(text: str):
-                # 拦截回调：返回命中的规则名（None 表示通过），命中即取消该条回复
-                if cancel_on_at and "@" in text:
-                    self._record_intercept(account_label, oid, "正文含@", text)
-                    return "正文含@"
-                if cancel_on_md and _has_markdown_feature(text):
-                    self._record_intercept(account_label, oid, "markdown特征", text)
-                    return "markdown特征"
-                return None
-
         at_enabled = route is not None and bool(route.at_enable and route.at_uname)
         if at_enabled:
 
             def postprocess(raw: str):
                 # at 路由：JSON 解析（容错规范见 _parse_at_reply_json）+ 引文清洗；
-                # 解析失败标记格式不合规，默认策略下由 _chat 取消回复（D5）
+                # 解析失败取消该条回复（由 _chat 丢弃：不发送、不写上下文、不计熔断）
                 parsed = _parse_at_reply_json(raw)
                 if parsed is None:
-                    if format_guard is not None:
-                        self._record_intercept(account_label, oid, "JSON格式错误", raw)
-                    else:
-                        logger.info(
-                            f"[拦截·旁路] 账号={account_label} av{oid} "
-                            "原因=JSON格式错误(拦截总开关已关闭，原文照发、不at) "
-                            f"原文前30字={raw[:30]}"
-                        )
-                    return _strip_code_fence(raw), False, False
+                    logger.warning(
+                        f"[取消回复] 账号={account_label} av{oid} "
+                        f"原因=JSON解析失败 原文前30字={raw[:30]}"
+                    )
+                    return raw, False, False
                 at_flag, reply = parsed
                 if clean is not None:
                     reply = clean(reply)
@@ -1292,7 +1242,6 @@ class BilibiliLive(Star):
             message=prompt_text,
             route=route,
             postprocess=postprocess,
-            format_guard=format_guard,
         )
         return text, at_flag
 
@@ -1550,7 +1499,6 @@ class BilibiliLive(Star):
 
         await self._send_message(
             sender=sender,
-            sender_name=message.user_name,
             message=self._format_live_item(message, msg_type, content),
             cache_key=cache_key,
         )
@@ -1617,7 +1565,7 @@ class BilibiliLive(Star):
             )
 
     async def _send_message(
-        self, sender: str, sender_name: str, message: str, cache_key: str | None = None
+        self, sender: str, message: str, cache_key: str | None = None
     ):
         """发送消息"""
         logger.debug(f"bilibili_live message: {message}")
@@ -1643,40 +1591,6 @@ class BilibiliLive(Star):
                 return
             for dest in self.config["plugin_settings"]["forward_destinations"]:
                 await self.context.send_message(dest, MessageChain([Plain(resp_text)]))
-        elif work_mode == "llm_chat_callback":
-            method = self.config["plugin_settings"]["llm_chat_callback"][
-                "callback_method"
-            ]
-            url = self.config["plugin_settings"]["llm_chat_callback"]["callback_url"]
-            resp_text = await self.llm_chat.gen_live_reply(sender, message)
-            if resp_text is None:
-                return
-
-            async with aiohttp.ClientSession() as session:
-                if method == "GET":
-                    params = {
-                        "sender": sender,
-                        "sender_name": sender_name,
-                        "message": resp_text,
-                    }
-                    async with session.get(url, params=params) as resp:
-                        if resp.status != 200:
-                            logger.error(
-                                f"回调失败: {resp.status}, {await resp.text()}"
-                            )
-                else:
-                    async with session.post(
-                        url,
-                        json={
-                            "sender": sender,
-                            "sender_name": sender_name,
-                            "message": resp_text,
-                        },
-                    ) as resp:
-                        if resp.status != 200:
-                            logger.error(
-                                f"回调失败: {resp.status}, {await resp.text()}"
-                            )
 
     async def terminate(self):
         """清理资源"""

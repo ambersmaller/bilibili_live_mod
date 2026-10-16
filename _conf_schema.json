@@ -1,4 +1,117 @@
 {
+  "plugin_settings": {
+    "description": "插件设置",
+    "type": "object",
+    "items": {
+      "allow_message_type": {
+        "description": "允许的消息类型，以英文半角逗号分隔",
+        "type": "string",
+        "hint": "danmaku, gift, guard_buy, super_chat, like, enter_room"
+      },
+      "work_mode": {
+        "description": "工作模式",
+        "type": "string",
+        "options": [
+          "danmaku_bot",
+          "forward_only",
+          "llm_chat_forward"
+        ],
+        "hint": "danmaku_bot为主模式（弹幕机器人）；其余两种为测试用途。"
+      },
+      "trigger_prefix": {
+        "description": "弹幕触发前缀（仅弹幕机器人模式生效）",
+        "type": "string",
+        "default": "",
+        "hint": "如填 #问 ，仅『#问 …』的弹幕触发回复；留空则全部弹幕触发，活跃直播间易积压，不建议。"
+      },
+      "live_persona_prompt": {
+        "description": "直播间弹幕人设提示词",
+        "type": "string",
+        "default": "你是B站直播间的弹幕机器人「小助理」，是主播请来活跃气氛的捧哏。你性格活泼、接地气、爱接梗，把观众当朋友，熟悉直播圈和二次元文化。",
+        "hint": "机器人的身份与说话风格，自动附加内置输出规则；越短越省token。"
+      },
+      "comment_persona_prompt": {
+        "description": "视频评论区人设提示词",
+        "type": "string",
+        "default": "你是B站视频评论区里的热心网友「小助理」，是UP主请来陪观众聊天的头号粉丝。你熟悉B站社区文化和梗，说话自然有梗、像真人网友，对观众友好但不卑不亢。",
+        "hint": "评论区人设，自动附加内置输出规则；越短越省token。"
+      },
+      "forward_destinations": {
+        "description": "转发目标(umo)",
+        "type": "list",
+        "items": {
+          "type": "string"
+        }
+      },
+      "llm_chat_max_context": {
+        "description": "直播间弹幕LLM聊天最大上下文轮数",
+        "type": "int",
+        "default": 15,
+        "hint": "仅作用于直播间弹幕聊天；实际保存条数=该值×2；弹幕场景建议3~5。视频评论区的上下文轮数由下方『评论区LLM聊天最大上下文轮数』单独控制。"
+      },
+      "comment_context_rounds": {
+        "description": "视频评论区LLM聊天最大上下文轮数",
+        "type": "int",
+        "default": 8,
+        "hint": "仅作用于视频评论区回复（按视频/楼层分别记忆）；实际保存条数=该值×2；评论区prompt较长，建议5~10。"
+      },
+      "batch_reply": {
+        "description": "弹幕攒批回复（聚合多条消息后只回复一条）",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "是否启用",
+            "type": "bool",
+            "default": false,
+            "hint": "仅弹幕机器人模式生效：开启后，全部允许的直播消息类型先进入攒批，达到数量阈值或时间窗口后打包发给LLM，只回复一条弹幕；被攒批的消息全部计入上下文，不会丢失。替代原『随机丢弃（测试用）』。"
+          },
+          "max_batch": {
+            "description": "数量阈值（条）",
+            "type": "int",
+            "default": 5,
+            "hint": "攒够该条数立即打包发给LLM。"
+          },
+          "max_wait": {
+            "description": "时间窗口（秒）",
+            "type": "float",
+            "default": 10.0,
+            "hint": "从最早一条攒批消息开始计时，超时强制打包（即使不足数量阈值）。"
+          }
+        }
+      },
+      "llm_provider_id": {
+        "description": "LLM聊天使用的模型供应商（留空则跟随 AstrBot 当前使用的供应商）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "下拉选择已配置的供应商；留空跟随AstrBot当前使用的供应商。"
+      },
+      "llm_breaker": {
+        "description": "LLM连续失败熔断（单供应商保护）",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "是否启用",
+            "type": "bool",
+            "default": true,
+            "hint": "连续失败达阈值后暂停LLM调用（期间弹幕/评论不回复），冷却到期自动以真实请求探测恢复。"
+          },
+          "threshold": {
+            "description": "连续失败次数阈值",
+            "type": "int",
+            "default": 3,
+            "hint": "异常、超时、空响应均计为失败；达到该次数即熔断。"
+          },
+          "cooldown": {
+            "description": "熔断冷却时长（秒）",
+            "type": "float",
+            "default": 120,
+            "hint": "冷却期内跳过所有LLM调用；熔断期间评论区轮询也暂停（不推进已读位置）。"
+          }
+        }
+      }
+    }
+  },
   "blivedm_open_live": {
     "description": "B站开放平台接入（与Web接入二选一）",
     "type": "object",
@@ -257,30 +370,6 @@
             "hint": "留空使用内置保守准则。写得越具体，误at越少。"
           }
         }
-      },
-      "reply_guard": {
-        "description": "回复格式拦截（LLM输出异常时取消该条回复）",
-        "type": "object",
-        "items": {
-          "enable": {
-            "description": "是否启用回复格式拦截",
-            "type": "bool",
-            "default": true,
-            "hint": "发送前对LLM输出做格式监测，命中异常直接取消回复（不发送、不计入上下文）。JSON格式错误（@路由）为固定检查项，随总开关生效。该开关定位为调试逃生门，正常运营不应关闭。"
-          },
-          "cancel_on_at_sign": {
-            "description": "回复正文含@符号时取消",
-            "type": "bool",
-            "default": true,
-            "hint": "@一律由系统拼装，正文出现@说明模型擅自@了人（at路由）或违反禁令（普通路由）。"
-          },
-          "cancel_on_markdown": {
-            "description": "回复含markdown特征时取消",
-            "type": "bool",
-            "default": true,
-            "hint": "检测代码围栏、加粗、标题、链接；这些格式在评论正文里几乎不可能合法出现，模型输出即未遵守输出规则。"
-          }
-        }
       }
     }
   },
@@ -361,138 +450,6 @@
         "type": "int",
         "default": 40,
         "hint": "上限与账号等级相关，低等级账号建议填20。"
-      }
-    }
-  },
-  "plugin_settings": {
-    "description": "插件设置",
-    "type": "object",
-    "items": {
-      "allow_message_type": {
-        "description": "允许的消息类型，以英文半角逗号分隔",
-        "type": "string",
-        "hint": "danmaku, gift, guard_buy, super_chat, like, enter_room"
-      },
-      "work_mode": {
-        "description": "工作模式",
-        "type": "string",
-        "options": [
-          "danmaku_bot",
-          "forward_only",
-          "llm_chat_forward",
-          "llm_chat_callback"
-        ],
-        "hint": "danmaku_bot为主模式（弹幕机器人）；其余三种为测试用途。"
-      },
-      "trigger_prefix": {
-        "description": "弹幕触发前缀（仅弹幕机器人模式生效）",
-        "type": "string",
-        "default": "",
-        "hint": "如填 #问 ，仅『#问 …』的弹幕触发回复；留空则全部弹幕触发，活跃直播间易积压，不建议。"
-      },
-      "live_persona_prompt": {
-        "description": "直播间弹幕人设提示词",
-        "type": "string",
-        "default": "你是B站直播间的弹幕机器人「小助理」，是主播请来活跃气氛的捧哏。你性格活泼、接地气、爱接梗，把观众当朋友，熟悉直播圈和二次元文化。",
-        "hint": "机器人的身份与说话风格，自动附加内置输出规则；越短越省token。"
-      },
-      "comment_persona_prompt": {
-        "description": "视频评论区人设提示词",
-        "type": "string",
-        "default": "你是B站视频评论区里的热心网友「小助理」，是UP主请来陪观众聊天的头号粉丝。你熟悉B站社区文化和梗，说话自然有梗、像真人网友，对观众友好但不卑不亢。",
-        "hint": "评论区人设，自动附加内置输出规则；越短越省token。"
-      },
-      "forward_destinations": {
-        "description": "转发目标(umo)",
-        "type": "list",
-        "items": {
-          "type": "string"
-        }
-      },
-      "llm_chat_max_context": {
-        "description": "直播间弹幕LLM聊天最大上下文轮数",
-        "type": "int",
-        "default": 15,
-        "hint": "仅作用于直播间弹幕聊天；实际保存条数=该值×2；弹幕场景建议3~5。视频评论区的上下文轮数由下方『评论区LLM聊天最大上下文轮数』单独控制。"
-      },
-      "comment_context_rounds": {
-        "description": "视频评论区LLM聊天最大上下文轮数",
-        "type": "int",
-        "default": 8,
-        "hint": "仅作用于视频评论区回复（按视频/楼层分别记忆）；实际保存条数=该值×2；评论区prompt较长，建议5~10。"
-      },
-      "llm_chat_callback": {
-        "description": "LLM聊天回调",
-        "type": "object",
-        "items": {
-          "callback_url": {
-            "description": "回调地址",
-            "type": "string"
-          },
-          "callback_method": {
-            "description": "回调方法",
-            "type": "string",
-            "options": [
-              "GET",
-              "POST"
-            ]
-          }
-        }
-      },
-      "batch_reply": {
-        "description": "弹幕攒批回复（聚合多条消息后只回复一条）",
-        "type": "object",
-        "items": {
-          "enable": {
-            "description": "是否启用",
-            "type": "bool",
-            "default": false,
-            "hint": "仅弹幕机器人模式生效：开启后，全部允许的直播消息类型先进入攒批，达到数量阈值或时间窗口后打包发给LLM，只回复一条弹幕；被攒批的消息全部计入上下文，不会丢失。替代原『随机丢弃（测试用）』。"
-          },
-          "max_batch": {
-            "description": "数量阈值（条）",
-            "type": "int",
-            "default": 5,
-            "hint": "攒够该条数立即打包发给LLM。"
-          },
-          "max_wait": {
-            "description": "时间窗口（秒）",
-            "type": "float",
-            "default": 10.0,
-            "hint": "从最早一条攒批消息开始计时，超时强制打包（即使不足数量阈值）。"
-          }
-        }
-      },
-      "llm_provider_id": {
-        "description": "LLM聊天使用的模型供应商（留空则跟随 AstrBot 当前使用的供应商）",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "下拉选择已配置的供应商；留空跟随AstrBot当前使用的供应商。"
-      },
-      "llm_breaker": {
-        "description": "LLM连续失败熔断（单供应商保护）",
-        "type": "object",
-        "items": {
-          "enable": {
-            "description": "是否启用",
-            "type": "bool",
-            "default": true,
-            "hint": "连续失败达阈值后暂停LLM调用（期间弹幕/评论不回复），冷却到期自动以真实请求探测恢复。"
-          },
-          "threshold": {
-            "description": "连续失败次数阈值",
-            "type": "int",
-            "default": 3,
-            "hint": "异常、超时、空响应均计为失败；达到该次数即熔断。"
-          },
-          "cooldown": {
-            "description": "熔断冷却时长（秒）",
-            "type": "float",
-            "default": 120,
-            "hint": "冷却期内跳过所有LLM调用；熔断期间评论区轮询也暂停（不推进已读位置）。"
-          }
-        }
       }
     }
   }
