@@ -163,6 +163,124 @@
         "type": "int",
         "default": 120,
         "hint": "主评论/被回复评论注入提示词前的截断长度，防长评论撑爆上下文。"
+      },
+      "x_only_own_videos": {
+        "description": "X账号：仅回复X自己发布的视频下的评论",
+        "type": "bool",
+        "default": true,
+        "hint": "只作用于X账号收到的通知：X在他人视频下留言后被回复、且该视频非X所有的，一律不回复；联合投稿中X为staff成员也算自己视频。注意本开关不约束Y账号自身的通知。元数据查询失败时该条评论不回复（宁缺毋滥）。"
+      },
+      "persona_routes": {
+        "description": "按视频tag的人设路由（最多5条，按顺序匹配，命中即用）",
+        "type": "template_list",
+        "hint": "默认人设恒为兜底；规则按列表顺序匹配，命中即用，最多5条（超出仅生效前5条）。需 AstrBot ≥ 4.10.4。",
+        "templates": {
+          "route": {
+            "name": "tag路由",
+            "display_item": "route_name",
+            "items": {
+              "route_name": {
+                "description": "规则名（仅用于区分）",
+                "type": "string",
+                "default": ""
+              },
+              "has_tags": {
+                "description": "包含任一tag即命中（逗号分隔）",
+                "type": "string",
+                "default": "",
+                "hint": "如：教程,攻略。大小写不敏感、精确匹配。与下方『缺少tag』为或关系。"
+              },
+              "missing_tags": {
+                "description": "缺少任一tag即命中（逗号分隔）",
+                "type": "string",
+                "default": "",
+                "hint": "如：恰饭,广告。两项都留空的规则不生效。"
+              },
+              "persona_prompt": {
+                "description": "该路由的人设提示词",
+                "type": "text",
+                "default": "",
+                "hint": "留空的规则不生效。"
+              },
+              "at_enable": {
+                "description": "允许本路由回复中@指定用户（由AI判断时机）",
+                "type": "bool",
+                "default": false
+              },
+              "at_mid": {
+                "description": "被@用户的mid（数字UID）",
+                "type": "string",
+                "default": "",
+                "hint": "填UID而非昵称；昵称由插件实时查询并缓存。留空或格式非法时本路由的@功能不生效。每条at都会给对方发通知，请谨慎开启。"
+              },
+              "at_position": {
+                "description": "@的位置",
+                "type": "string",
+                "options": ["prefix", "suffix"],
+                "default": "prefix"
+              },
+              "at_guide": {
+                "description": "@的判断准则（告诉AI什么场景才at）",
+                "type": "text",
+                "default": "",
+                "hint": "留空使用内置保守准则。写得越具体，误at越少。"
+              }
+            }
+          }
+        }
+      },
+      "default_at": {
+        "description": "默认人设（未命中路由时）的@设置",
+        "type": "object",
+        "items": {
+          "at_enable": {
+            "description": "是否开启",
+            "type": "bool",
+            "default": false
+          },
+          "at_mid": {
+            "description": "被@用户的mid",
+            "type": "string",
+            "default": "",
+            "hint": "填UID而非昵称；留空或非纯数字时@功能不生效。每条at都会给对方发通知，请谨慎开启。"
+          },
+          "at_position": {
+            "description": "@的位置",
+            "type": "string",
+            "options": ["prefix", "suffix"],
+            "default": "prefix"
+          },
+          "at_guide": {
+            "description": "@的判断准则",
+            "type": "text",
+            "default": "",
+            "hint": "留空使用内置保守准则。写得越具体，误at越少。"
+          }
+        }
+      },
+      "reply_guard": {
+        "description": "回复格式拦截（LLM输出异常时取消该条回复）",
+        "type": "object",
+        "items": {
+          "enable": {
+            "description": "是否启用回复格式拦截",
+            "type": "bool",
+            "default": true,
+            "hint": "发送前对LLM输出做格式监测，命中异常直接取消回复（不发送、不计入上下文）。JSON格式错误（@路由）为固定检查项，随总开关生效。该开关定位为调试逃生门，正常运营不应关闭。"
+          },
+          "cancel_on_at_sign": {
+            "description": "回复正文含@符号时取消",
+            "type": "bool",
+            "default": true,
+            "hint": "@一律由系统拼装，正文出现@说明模型擅自@了人（at路由）或违反禁令（普通路由）。"
+          },
+          "cancel_on_markdown": {
+            "description": "回复含markdown特征时取消",
+            "type": "bool",
+            "default": true,
+            "hint": "检测代码围栏、加粗、标题、链接；这些格式在评论正文里几乎不可能合法出现，模型输出即未遵守输出规则。"
+          }
+        }
       }
     }
   },
