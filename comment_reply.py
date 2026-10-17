@@ -418,9 +418,10 @@ class CommentReplyManager:
         """
         :param on_reply_needed: async (account_label, prompt_text, oid, root_id, route)
             -> tuple[str | None, bool]，由宿主完成LLM回复生成（人设取自route），
-            返回（正文，是否at）；正文None涵盖"不回复"与"JSON解析失败取消"两种
-            情形，manager 无需区分。root_id为评论所在楼层的根评论id（"0"表示对
-            视频的直接评论），供宿主按楼层维护上下文
+            返回（正文，是否at）；正文None表示"不回复"（LLM失败/空回复/纯复读），
+            at标记缺失时宿主按不at处理、正文照发，manager 无需感知格式。
+            root_id为评论所在楼层的根评论id（"0"表示对视频的直接评论），
+            供宿主按楼层维护上下文
         :param get_video_context: async (oid) -> str | None，由宿主识别评论所属视频
             内容（【当前视频信息】文本），置于prompt最前；None表示不识别
         :param poll_gate: 可选的同步门控 callable，返回False时跳过本轮轮询
@@ -657,8 +658,8 @@ class CommentReplyManager:
                 at_position="prefix", at_guide="",
             )
         # [1.3·D7] at昵称解析在路由判定后立即定型（24h缓存，落状态文件）：
-        # 失败则本轮at关闭（按普通路由形态生成），此后链路（prompt注入、JSON
-        # 协议、at拼装）一律以 route.at_uname 为准，不再二次查询
+        # 失败则本轮at关闭（按普通路由形态生成），此后链路（prompt注入、[AT]
+        # 标记协议、at拼装）一律以 route.at_uname 为准，不再二次查询
         if route.at_enable:
             try:
                 uname = await self._resolve_at_uname(route.at_mid)

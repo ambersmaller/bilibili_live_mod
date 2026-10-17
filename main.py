@@ -74,10 +74,11 @@ AT_BLOCK_TEMPLATE = (
     "【@提及功能（系统能力）】\n"
     "你的回复可以附带提及（@）用户「{nickname}」（UID {mid}）。是否提及由你按以下准则判断：\n"
     "{at_guide}\n\n"
-    "输出格式要求：只输出一个 JSON 对象，不要代码围栏、不要任何额外文字：\n"
-    '{{"at": true 或 false, "reply": "回复正文"}}\n'
-    "- reply 只写回复正文，正文中禁止出现 @ 符号，提及由系统自动添加在回复{position_word}\n"
-    "- 拿不准时一律 at=false"
+    "输出格式（只输出正文，不要解释）：\n"
+    "- 需要提及时：正文最前面加标记 [AT]，与正文同一行，例如：[AT] 收到，稍后私信你\n"
+    "- 不需要提及时：直接输出正文，不要加任何标记\n"
+    "- 标记只写在最开头，系统会替换成对「{nickname}」的提及（放在回复{position_word}）\n"
+    "- 正文里不要自己写 @；拿不准时不要加标记"
 )
 
 # 内置默认 at 判断准则（用户留空 at_guide 时使用，保守取向）
@@ -155,34 +156,21 @@ def _make_comment_echo_cleaner(prompt_text: str):
     return clean
 
 
-def _strip_code_fence(text: str) -> str:
-    """剥除文本首尾的代码围栏（```json 等），无围栏时原样返回"""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z]*\s*", "", stripped)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    return stripped.strip()
+# at 控制位标记：正文开头的 [AT]（兼容【AT】/（AT）/全角冒号/大小写）。
+# 只作控制位使用、发送前剥除；用 match 而非 search，正文中间出现的同形字不匹配，
+# 故不会误伤"at 15:00 开播"这类以英文 at 开头的正文
+_AT_MARK_RE = re.compile(r"^\s*[\[【(（]\s*AT\s*[\]】)）]\s*[：:]?\s*", re.IGNORECASE)
 
 
-def _parse_at_reply_json(raw: str) -> tuple[bool, str] | None:
-    """解析 at 路由的 LLM JSON 输出（容错按序：剥围栏→截取{...}→loads→字段校验）。
-    返回 (是否at, 回复正文)；无法解析或 reply 缺失/空返回 None（视为格式错误）。
-    at 字段严格布尔：非 true（如 "true"、1、缺失）一律按 false 处理"""
-    text = _strip_code_fence(raw)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        obj = json.loads(text[start : end + 1])
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    reply = obj.get("reply")
-    if not isinstance(reply, str) or not reply.strip():
-        return None
-    return obj.get("at") is True, reply
+def _split_at_marker(raw: str) -> tuple[bool, str]:
+    """从 LLM 输出中拆出 at 控制位：开头有 [AT] 标记表示本次回复需要 @。
+    返回（是否at，正文）；标记缺失/不成对时按不 at 处理、正文原样返回，
+    因此格式偏差最坏只丢 @、不丢回复（区别于旧 JSON 协议的整条取消）"""
+    text = (raw or "").strip()
+    m = _AT_MARK_RE.match(text)
+    if not m:
+        return False, text
+    return True, text[m.end() :].strip()
 
 
 class LlmChatService:
@@ -234,14 +222,13 @@ class LlmChatService:
         self, sender: str, message: str, route=None, postprocess=None
     ) -> tuple[str | None, bool]:
         """视频评论区的 LLM 回复生成。返回 (回复文本, 是否at)；
-        文本 None 表示不回复（含LLM失败、空回复、纯复读与JSON解析失败取消）。
+        文本 None 表示不回复（含LLM失败、空回复与纯复读）。
 
         route: 路由对象（人设 + at 配置，见 comment_reply.Route）；为 None 或
         人设为空时回退默认评论区人设。at 开启时切换输出规则变体并在
-        system prompt 末尾追加 at 协议块（D2/D3），LLM 以 JSON 输出，
-        由 postprocess 解析出 (正文, 是否at)；JSON 解析失败时取消该条回复。
-        postprocess: (raw) -> (正文, 是否at, 解析是否成功)，由宿主构造
-        （JSON 解析 + 引文清洗）"""
+        system prompt 末尾追加 at 协议块（D2/D3），LLM 以纯文本输出、需要 @
+        时在正文开头加 [AT] 标记，由 postprocess 剥离出 (正文, 是否at)。
+        postprocess: (raw) -> (正文, 是否at)，由宿主构造（剥标记 + 引文清洗）"""
         if route is not None and route.persona:
             persona = route.persona
         else:
@@ -292,10 +279,9 @@ class LlmChatService:
         """调用 LLM 并更新上下文（同一发送者的调用与写入串行化）。
         返回 (回复文本, 是否at)；文本 None 表示不回复。
 
-        postprocess: (raw) -> (正文, 是否at, 解析是否成功)，取代旧的 clean 参数
-        （评论路径是 clean 的唯一使用者，弹幕路径不传，行为完全不变）；
-        解析失败（仅 at 路由 JSON 解析失败会置位）时取消该条回复：
-        不写上下文、不计熔断失败，取消日志由宿主闭包输出"""
+        postprocess: (raw) -> (正文, 是否at)，取代旧的 clean 参数（评论路径是
+        clean 的唯一使用者，弹幕路径不传，行为完全不变）；正文为空时按不回复
+        处理：不写上下文、不计熔断失败"""
         guard = self._guard
         if guard is not None and not guard.allow():
             logger.debug("LLM 熔断冷却中，本次调用跳过")
@@ -332,13 +318,9 @@ class LlmChatService:
                 guard.record_success()
             raw = resp.result_chain.get_plain_text()
             if postprocess is not None:
-                text, at_flag, ok = postprocess(raw)
+                text, at_flag = postprocess(raw)
             else:
-                text, at_flag, ok = raw, False, True
-            if not ok:
-                # at 路由 JSON 解析失败：取消该条回复，
-                # 不写上下文、不计熔断失败（取消日志由宿主闭包输出）
-                return None, False
+                text, at_flag = raw, False
             if not text.strip():
                 # 空回复或纯复读（被清理为空）：不计入上下文，
                 # 避免留下悬空的用户消息诱发后续复读
@@ -349,7 +331,7 @@ class LlmChatService:
             return text, at_flag
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.1.0")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.2.0")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -1204,36 +1186,28 @@ class BilibiliLive(Star):
         人设取自路由（route.persona，默认路由即评论区默认人设）。X/Y两账号的
         通知即使指向同一视频同一楼层，上下文也彼此隔离，杜绝"串台"（见
         CHANGELOG 2.6.3）；楼中楼评论按楼层独立记忆，直接评论按视频共享记忆。
-        at 路由时 LLM 以 JSON 输出由 postprocess 解析（JSON 解析与引文清洗
-        都定义在宿主侧，manager 不感知格式细节，闭包持有账号/视频便于日志
-        定位）；JSON 解析失败时取消该条回复。返回 (回复文本, 是否at)；文本
-        None 涵盖"不回复"与"JSON解析失败取消"两种情形。截断与复读校验由
-        CommentReplyManager 负责（维持现状位置）"""
+        at 路由时 LLM 在正文开头可选输出 [AT] 标记；剥离标记与引文清洗都定义在
+        宿主侧（postprocess 闭包），manager 不感知格式细节。返回
+        (回复文本, 是否at)；文本 None 仅表示"不回复"（LLM失败/空回复/纯复读）。
+        截断与复读校验由 CommentReplyManager 负责（维持现状位置）"""
         thread = f"_r{root_id}" if root_id not in ("", "0") else ""
         clean = _make_comment_echo_cleaner(prompt_text)
         at_enabled = route is not None and bool(route.at_enable and route.at_uname)
         if at_enabled:
 
             def postprocess(raw: str):
-                # at 路由：JSON 解析（容错规范见 _parse_at_reply_json）+ 引文清洗；
-                # 解析失败取消该条回复（由 _chat 丢弃：不发送、不写上下文、不计熔断）
-                parsed = _parse_at_reply_json(raw)
-                if parsed is None:
-                    logger.warning(
-                        f"[取消回复] 账号={account_label} av{oid} "
-                        f"原因=JSON解析失败 原文前30字={raw[:30]}"
-                    )
-                    return raw, False, False
-                at_flag, reply = parsed
+                # at 路由：剥控制位标记（[AT]）+ 引文清洗；标记缺失按不 at 处理、
+                # 正文照发，不再因输出格式问题取消整条回复
+                at_flag, reply = _split_at_marker(raw)
                 if clean is not None:
                     reply = clean(reply)
-                return reply, at_flag, True
+                return reply, at_flag
 
         elif clean is not None:
 
             def postprocess(raw: str):
                 # 普通路由：仅引文清洗，行为与旧 clean 参数完全一致
-                return clean(raw), False, True
+                return clean(raw), False
 
         else:
             postprocess = None
