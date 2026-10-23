@@ -8,6 +8,10 @@ BiliCommentBot、bilibili-ai-bot 等成熟同类项目的防风控实践：
 v3.0.0 新增：X账号『仅回复自己视频』过滤（owner/staff 判定）、tag 人设路由
 （Route 数据类，由宿主注入的 resolve_route 判定）、回复中@指定用户
 （at_name_to_mid 拼装 + 发送后校验）。
+
+v3.3.0 风控加固：判断顺序改为「本地归属(0请求) → 新视频冷静期抽样 → 元数据」，
+已读游标按实际处理结果推进（defer 可补回、最多延后3次），元数据失败由负缓存
+与熔断拦截，发送命中风控码即暂停队列，并支持洪峰期自适应拉长轮询间隔。
 """
 import asyncio
 import hashlib
@@ -23,6 +27,7 @@ import aiohttp
 from astrbot.api import logger
 
 from .blivedm.clients.ws_base import USER_AGENT
+from .failure_guard import FailureGuard
 
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 REPLY_FEED_URL = "https://api.bilibili.com/x/msgfeed/reply"
@@ -48,6 +53,20 @@ FEED_PAGE_SIZE = 20
 
 # 评论回复队列上限
 REPLY_QUEUE_MAX = 100
+
+# 发送触发风控后的暂停时长（秒）：期内既不轮询也不发送，避免继续恶化
+SEND_RATE_LIMIT_PAUSE = 600
+
+# 自适应轮询：出现延后/风控时按倍数放大间隔，倍数与绝对秒数双重封顶
+POLL_BACKOFF_FACTOR = 1.5
+POLL_BACKOFF_MAX = 4.0
+POLL_INTERVAL_MAX = 1800
+
+# 单条通知最多延后几次（必须有上限：否则元数据长期不可用会让已读游标永久卡死）
+DEFER_MAX = 3
+
+# 新视频抽样计数表（comment_state.json → video_seen）容量上限
+VIDEO_SEEN_MAX = 500
 
 # 频率/风控类错误码（BiliCommentBot 实战汇总），触发时应调大发送间隔
 RATE_LIMIT_CODES = {-412, -509, 412, 509, 799, 10403}
@@ -104,6 +123,8 @@ class BiliCommentClient:
         self._mixin_key_fetched_at = 0.0
         self.mid = ""
         self.uname = ""
+        # 本轮轮询是否遭遇风控（供自适应退避判定，每轮开头清零）
+        self.last_throttled = False
 
     async def start(self):
         if self._session is None:
@@ -188,6 +209,7 @@ class BiliCommentClient:
 
     async def fetch_reply_feed(self) -> list[dict]:
         """轮询『收到评论』消息流（最新一页，新→旧），失败返回空列表"""
+        self.last_throttled = False
         if not await self._ensure_mixin_key():
             return []
         params = self._wbi_sign(
@@ -201,8 +223,9 @@ class BiliCommentClient:
         except Exception as e:
             logger.warning(f"[{self.label}] 收到评论轮询请求异常: {e}")
             return []
-        # v_voucher 是wbi缺失/被风控的标志：重置密钥重试一次
-        if result.get("v_voucher") or result.get("code") == -403:
+        # v_voucher / -352 / -412 都是风控标志：重置密钥重试一次
+        if result.get("v_voucher") or result.get("code") in (-403, -352, -412):
+            self.last_throttled = True
             logger.debug(f"[{self.label}] 收到评论轮询遭遇风控校验，重置wbi密钥重试")
             self._reset_mixin_key()
             if await self._ensure_mixin_key():
@@ -217,7 +240,8 @@ class BiliCommentClient:
                 except Exception as e:
                     logger.warning(f"[{self.label}] 收到评论轮询重试请求异常: {e}")
                     return []
-        if result.get("v_voucher") or result.get("code") == -403:
+        if result.get("v_voucher") or result.get("code") in (-403, -352, -412):
+            self.last_throttled = True
             logger.warning(f"[{self.label}] 收到评论轮询被风控，本轮跳过")
             return []
         code = result.get("code")
@@ -301,9 +325,10 @@ class BiliCommentClient:
         message: str,
         reply_type: str = "1",
         at_map: dict[str, int] | None = None,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         """发布一条视频评论回复（POST reply/add，仅需Cookie+CSRF，无需wbi）。
-        返回（发送成功, at验证通过）；无 at_map 时第二返回值恒 True。
+        返回（发送成功, at验证通过, 是否触发风控）；无 at_map 时第二返回值恒 True。
+        第三返回值供 manager 暂停发送队列：命中频率/风控类错误码时为 True。
 
         at_map: {"昵称": mid}，非空时 POST 体携带 at_name_to_mid（JSON字符串），
         且 message 文本中的 `@昵称 ` 须与映射键字面一致（纯文本@无效、不触发
@@ -312,7 +337,7 @@ class BiliCommentClient:
         csrf = _parse_cookie_str(self._get_cookie()).get("bili_jct", "")
         if not csrf:
             logger.error(f"[{self.label}] 缺少bili_jct，无法发送评论回复")
-            return False, True
+            return False, True, False
         data = {
             "type": reply_type,
             "oid": oid,
@@ -337,7 +362,7 @@ class BiliCommentClient:
                 result = await resp.json()
         except Exception as e:
             logger.error(f"[{self.label}] 评论回复请求异常: {e}")
-            return False, True
+            return False, True, False
         code = result.get("code")
         if code == 0:
             if at_map and not self._verify_at_result(result, at_map):
@@ -350,13 +375,14 @@ class BiliCommentClient:
                     f"at_name_to_mid={content.get('at_name_to_mid')}, "
                     f"members={[m.get('mid') for m in (content.get('members') or []) if isinstance(m, dict)]}"
                 )
-                return True, False
-            return True, True
+                return True, False, False
+            return True, True, False
         if code in RATE_LIMIT_CODES or code == 12015:
             logger.warning(
                 f"[{self.label}] 评论回复触发风控: code={code}, "
                 f"message={result.get('message')}，建议调大发送间隔"
             )
+            return False, True, True
         elif code == -101:
             logger.error(f"[{self.label}] 评论回复失败: Cookie已失效(code=-101)，请重新获取")
         elif code == -111:
@@ -365,7 +391,7 @@ class BiliCommentClient:
             logger.warning(
                 f"[{self.label}] 评论回复失败: code={code}, message={result.get('message')}"
             )
-        return False, True
+        return False, True, False
 
     @staticmethod
     def _verify_at_result(result: dict, at_map: dict[str, int]) -> bool:
@@ -414,6 +440,10 @@ class CommentReplyManager:
         get_video_meta=None,
         resolve_route=None,
         has_routes=False,
+        get_video_owner=None,
+        on_alert=None,
+        new_video_cooldown=600,
+        new_video_sample=3,
     ):
         """
         :param on_reply_needed: async (account_label, prompt_text, oid, root_id, route)
@@ -434,6 +464,12 @@ class CommentReplyManager:
             路由判定（默认路由也在其中返回）；每次调用须返回新建的 Route 实例
         :param has_routes: 路由表是否非空（惰性元数据获取的条件之一：
             仅当 X账号+owner过滤 或 路由表非空 时才请求元数据）
+        :param get_video_owner: async (oid) -> dict | None，纯本地归属查询
+            （0 请求，进程缓存/长期落盘/投稿列表），命中即免去元数据请求
+        :param on_alert: async (text) -> None，异常告警回调（元数据熔断、
+            发送风控、投稿列表同步连续失败时触发），None 表示不推送
+        :param new_video_cooldown: 新视频冷静期（秒），0 表示关闭抽样
+        :param new_video_sample: 冷静期内每 N 条回 1 条（1 表示不抽样）
         """
         self._y_client = y_client
         self._x_client = x_client
@@ -460,11 +496,30 @@ class CommentReplyManager:
         self._state = self._load_state()
         # at昵称解析串行化锁：防X/Y双轮询并发对同一mid重复查询/重复写缓存
         self._at_uname_lock = asyncio.Lock()
+        self._get_video_owner = get_video_owner
+        self._on_alert = on_alert
+        self._new_video_cooldown = max(0.0, float(new_video_cooldown))
+        self._new_video_sample = max(1, int(new_video_sample))
+        # 发送风控闸门：命中风控码立即打开（threshold=1），冷却期内不轮询不发送
+        self._send_guard = FailureGuard(
+            threshold=1, cooldown=SEND_RATE_LIMIT_PAUSE, name="评论发送"
+        )
+        # 自适应轮询倍数（出现延后/风控时放大）与延后计数（防游标卡死）
+        self._backoff = 1.0
+        self._defer: dict[str, int] = {}
+        # 单轮最多扫描条数：失败路径不再把整页通知全扫一遍（对齐 max_replies 的3倍）
+        self._max_scan_per_cycle = max(10, 3 * self._max_replies_per_cycle)
+        self._last_alert_at = 0.0
 
     @property
     def y_client(self) -> BiliCommentClient:
         """Y账号客户端（宿主注入元数据层 wbi 签名等用途）"""
         return self._y_client
+
+    @property
+    def x_mid(self) -> str:
+        """X账号mid（未启用或登录态校验失败时为空串）"""
+        return self._account_mids.get("X", "")
 
     async def start(self):
         """启动轮询与回复任务。Y账号登录态必需，X账号登录态失败仅禁用X轮询"""
@@ -513,25 +568,47 @@ class CommentReplyManager:
             await self._x_client.stop()
 
     async def _poll_loop(self, client: BiliCommentClient):
-        # 启动即轮询一轮，之后按间隔周期轮询（外加少量随机抖动）
+        # 启动即轮询一轮，之后按间隔周期轮询（外加少量随机抖动）。
+        # 出现延后（元数据不可用）或轮询命中风控时，间隔临时放大，洪峰退去自动回落
         while True:
+            deferred = False
             try:
                 if self._poll_gate is not None and not self._poll_gate():
                     logger.debug(
                         f"[{client.label}] 轮询门控关闭（如LLM熔断中），本轮跳过"
                     )
+                elif not self._send_guard.allow():
+                    logger.debug(
+                        f"[{client.label}] 评论发送风控冷却中，本轮跳过轮询"
+                    )
                 else:
-                    await self._poll_once(client)
+                    deferred = await self._poll_once(client)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning(f"[{client.label}] 收到评论处理异常: {e}")
-            await asyncio.sleep(self._poll_interval + random.uniform(0, 15))
+            if deferred or client.last_throttled:
+                self._backoff = min(self._backoff * POLL_BACKOFF_FACTOR, POLL_BACKOFF_MAX)
+                logger.info(
+                    f"[{client.label}] 本轮出现延后/风控，轮询间隔临时放大 "
+                    f"{self._backoff:.1f} 倍"
+                )
+            else:
+                self._backoff = 1.0
+            await asyncio.sleep(
+                min(self._poll_interval * self._backoff, POLL_INTERVAL_MAX)
+                + random.uniform(0, 15)
+            )
 
-    async def _poll_once(self, client: BiliCommentClient):
+    async def _poll_once(self, client: BiliCommentClient) -> bool:
+        """轮询一轮并处理新通知。返回本轮是否出现延后（供自适应退避判定）。
+
+        已读游标按「实际处理结果」推进：只有真正处理过（handled/skipped）的
+        通知才前移，defer 的条目保留原位、下轮重试——此前是处理前直接推到
+        最新，一旦元数据接口被风控，整批评论就被永久标记已读、无法补回。"""
         items = await client.fetch_reply_feed()
         if not items:
-            return
+            return False
         account = client.label
         newest_id = str(items[0].get("id") or "")
         last_id = self._state.get("last_id", {}).get(account)
@@ -544,7 +621,7 @@ class CommentReplyManager:
                     f"[{account}] 评论区已建立初始基准（最新通知id={newest_id}），"
                     "从下一轮开始处理新评论"
                 )
-            return
+            return False
         last_id_num = self._to_int(last_id)
         fresh = []
         for item in items:
@@ -558,26 +635,44 @@ class CommentReplyManager:
             elif nid == last_id:
                 continue
             fresh.append(item)
-        # 已读位置直接推进到最新：超额的评论也视为已读不再回复（防积压，参考BiliCommentBot的max_process）
-        self._set_last_id(account, newest_id)
-        self._save_state()
         if not fresh:
-            return
+            return False
         fresh.reverse()  # 旧→新，先回较早的评论
+        cursor = last_id
         handled = 0
+        scanned = 0
+        deferred = False
         for item in fresh:
             if handled >= self._max_replies_per_cycle:
                 logger.debug(
-                    f"[{account}] 本轮新评论超过上限 {self._max_replies_per_cycle} 条，"
-                    "其余已标记为已读"
+                    f"[{account}] 本轮回复数达上限 {self._max_replies_per_cycle} 条，"
+                    "其余顺延到下一轮"
                 )
                 break
-            if await self._process_item(account, item):
+            if scanned >= self._max_scan_per_cycle:
+                logger.debug(
+                    f"[{account}] 本轮扫描数达上限 {self._max_scan_per_cycle} 条，"
+                    "其余顺延到下一轮"
+                )
+                break
+            scanned += 1
+            outcome = await self._process_item(account, item)
+            if outcome == "defer":
+                deferred = True
+                break
+            cursor = str(item.get("id") or cursor)
+            if outcome == "handled":
                 handled += 1
+        self._set_last_id(account, cursor)
+        self._save_state()
+        return deferred
 
-    async def _process_item(self, account: str, item: dict) -> bool:
-        """处理单条通知：过滤→元数据/owner过滤→路由判定→at昵称解析→LLM生成回复
-        →at拼装→入队（由Y账号发送）。返回是否入队"""
+    async def _process_item(self, account: str, item: dict) -> str:
+        """处理单条通知：过滤→本地归属/冷静期抽样→元数据/owner过滤→路由判定
+        →at昵称解析→LLM生成回复→at拼装→入队（由Y账号发送）。
+
+        返回三态：'handled'（已入队）/ 'skipped'（明确不回复）/ 'defer'
+        （暂时无法判定，如元数据不可用且无本地归属——游标不推进，留待下轮补回）"""
         it = item.get("item") or {}
         user = item.get("user") or {}
         nid = str(item.get("id") or "")
@@ -589,20 +684,20 @@ class CommentReplyManager:
             logger.debug(
                 f"[{account}] 忽略非视频评论通知(id={nid}, business={it.get('business')})"
             )
-            return False
+            return "skipped"
         # 忽略本插件两个账号自身的消息：防自我回复套娃，尤其防Y回复X视频评论后
         # X回复Y、Y再回X的无限循环
         if mid in self._own_mids:
             logger.debug(f"[{account}] 忽略本插件账号自身的消息(id={nid}, mid={mid})")
-            return False
+            return "skipped"
         if not content:
             logger.debug(f"[{account}] 忽略空内容评论通知(id={nid})")
-            return False
+            return "skipped"
         oid = str(it.get("subject_id") or "")
         source_id = str(it.get("source_id") or "")
         if not oid or not source_id:
             logger.debug(f"[{account}] 评论通知缺少关键字段(id={nid})，跳过")
-            return False
+            return "skipped"
         root_id = str(it.get("root_id") or "0")
         is_thread = root_id not in ("", "0")
         root = root_id if is_thread else source_id
@@ -621,37 +716,53 @@ class CommentReplyManager:
                     f"[{account}] 楼层r{root}已达最大回复深度"
                     f"({self._max_reply_depth})，不再回复(id={nid})"
                 )
-                return False
-        # [1.1/1.2] 元数据获取（惰性）：仅 owner 过滤或路由表需要时才请求 view/detail；
-        # 元数据层带进程内10分钟缓存，同一视频的连续评论不会重复请求
-        meta = None
-        need_meta = (account == "X" and self._x_owner_only) or self._has_routes
-        if need_meta and self._get_video_meta is not None:
+                return "skipped"
+        # [3.3] 本地归属（0 请求）：进程缓存 → 长期归属落盘 → X投稿列表。
+        # 命中即可直接判 owner，不再为每条评论发一次 view/detail（此前新视频评论
+        # 洪峰会把同一条匿名请求打穿，触发 WAF 412）
+        owner = None
+        if self._get_video_owner is not None:
             try:
-                meta = await self._get_video_meta(oid)
+                owner = await self._get_video_owner(oid)
             except Exception as e:
-                logger.warning(f"[{account}] 视频元数据获取失败(id={nid}): {e}")
+                logger.debug(f"[{account}] 本地视频归属查询失败(oid={oid}): {e}")
+        # [3.3] 新视频冷静期抽样：纯本地判定，必须早于任何网络请求，
+        # 否则新视频发布瞬间的评论洪峰仍会逐条打到元数据接口
+        if self._cooldown_skip(account, oid, nid, owner):
+            return "skipped"
+        meta = None
         if account == "X" and self._x_owner_only:
-            # 仅回复X自己发布的视频下的评论；元数据取不到时fail-closed跳过（宁缺毋滥）
-            if meta is None:
-                logger.info(
-                    f"[{account}] 视频元数据未获取到，按『仅回复X自己视频』策略跳过(id={nid})"
-                )
-                return False
-            owner_mids = {meta.get("owner_mid") or ""} | set(
-                meta.get("staff_mids") or []
-            )
+            # 仅回复X自己发布的视频下的评论（含联合投稿X为staff）。
+            # 无本地归属且元数据取不到时 fail-closed 跳过（宁缺毋滥），
+            # 但走 defer 保留游标，风控解除后可补回
+            if owner is None:
+                meta = await self._fetch_meta_soft(account, oid, nid)
+                if meta is None:
+                    return self._defer_or_skip(
+                        account, nid, "元数据不可用且无本地归属，按『仅回复X自己视频』跳过"
+                    )
+                owner = meta
+            owner_mids = {str(owner.get("owner_mid") or "")} | {
+                str(m) for m in (owner.get("staff_mids") or [])
+            }
             if self._account_mids.get("X", "") not in owner_mids:
                 logger.info(
                     f"[{account}] 视频av{oid}非X账号(或其联合投稿staff)发布，跳过回复(id={nid})"
                 )
-                return False
-        # [1.2] 路由判定：tags来自元数据；未获取/取不到(tags=None)时走默认路由，
+                return "skipped"
+        # [1.2] 路由判定：tags 来自元数据或本地归属缓存；都没有时走默认路由，
         # 不做 tag 判定（missing_tags 在 tags 为 None 时会误判命中）
+        tags = meta.get("tags") if meta is not None else None
+        if tags is None and owner is not None:
+            tags = owner.get("tags")
+        if self._has_routes and tags is None:
+            # 本地无 tags（仅投稿列表命中，或 tags 已超期）：补一次元数据，
+            # 失败不阻断，退回默认路由
+            meta = await self._fetch_meta_soft(account, oid, nid)
+            if meta is not None:
+                tags = meta.get("tags")
         if self._resolve_route is not None:
-            route = self._resolve_route(
-                meta.get("tags") if meta is not None else None
-            )
+            route = self._resolve_route(tags)
         else:
             route = Route(
                 name="默认", persona="", at_enable=False, at_mid="",
@@ -715,11 +826,11 @@ class CommentReplyManager:
             )
         except Exception as e:
             logger.warning(f"[{account}] 评论LLM回复生成失败(id={nid}): {e}")
-            return False
+            return "skipped"
         text = " ".join((text or "").split()).strip()
         if not text:
             logger.debug(f"[{account}] 评论(id={nid})无有效回复内容，跳过")
-            return False
+            return "skipped"
         # at拼装须晚于截断与复读校验（顺序约束）：截断上限预留 @昵称 片段长度，
         # 避免 prefix 拼装后超出 max_length、或 suffix 位置截出半个昵称
         use_at = bool(at_flag and route.at_uname and route.at_mid.isdigit())
@@ -748,7 +859,7 @@ class CommentReplyManager:
             logger.warning(
                 f"[{account}] 评论(id={nid})的AI回复与评论原文重复（复读），跳过发送"
             )
-            return False
+            return "skipped"
         # at拼装（仅at_flag为真且昵称已解析）：message在入队前完成拼装，
         # worker只做机械发送与验证；队列条目只扩展 at_map（不含位置信息）
         at_map = None
@@ -773,9 +884,81 @@ class CommentReplyManager:
                 }
             )
         except asyncio.QueueFull:
-            logger.warning(f"评论回复队列已满，丢弃: {text[:20]}")
+            logger.warning(f"评论回复队列已满，本轮延后: {text[:20]}")
+            return self._defer_or_skip(account, nid, "回复队列已满")
+        return "handled"
+
+    async def _fetch_meta_soft(self, account: str, oid: str, nid: str) -> dict | None:
+        """元数据获取（内部含进程缓存/负缓存/熔断）；异常不阻断流程，返回None"""
+        if self._get_video_meta is None:
+            return None
+        try:
+            return await self._get_video_meta(oid)
+        except Exception as e:
+            logger.warning(f"[{account}] 视频元数据获取失败(id={nid}): {e}")
+            return None
+
+    def _cooldown_skip(
+        self, account: str, oid: str, nid: str, owner: dict | None
+    ) -> bool:
+        """新视频冷静期抽样（纯本地）：视频首次被看到后的 cooldown 秒内，
+        第1条评论必回，其后每 sample 条回 1 条，其余标记已读跳过。
+
+        新视频发布瞬间的评论洪峰最容易触发风控，逐条回复既无意义也会把
+        元数据/发送接口打到限频。起点优先用视频发布时间(pubdate)，未知时
+        用首次看到的时间——老视频的 pubdate 很早，天然不会进入冷静期。
+        抽样计数落 comment_state.json 的 video_seen，跨重启继续生效。
+        """
+        if self._new_video_cooldown <= 0 or self._new_video_sample <= 1:
             return False
+        now = time.time()
+        seen = self._state.setdefault("video_seen", {})
+        entry = seen.get(oid)
+        if not isinstance(entry, dict):
+            created = int((owner or {}).get("created") or 0)
+            entry = {"first": created or now, "n": 0}
+            seen[oid] = entry
+            if len(seen) > VIDEO_SEEN_MAX:
+                for old_oid in list(seen)[: len(seen) - VIDEO_SEEN_MAX]:
+                    seen.pop(old_oid, None)
+        entry["n"] = int(entry.get("n") or 0) + 1
+        # 起点校正：拿到视频真实发布时间后，若明显早于「首次看到」的时间，
+        # 说明这是老视频（此前按 now 记的起点），改用发布时间 → 立即退出冷静期
+        created = int((owner or {}).get("created") or 0)
+        if created and created < float(entry.get("first") or 0) - 60:
+            entry["first"] = created
+        self._save_state()
+        if entry["n"] == 1:
+            return False
+        if now - float(entry.get("first") or now) >= self._new_video_cooldown:
+            return False
+        # 第1条已必定回复，其余按 (n-1) 取模：sample=3 时第1、4、7…条回复
+        if (entry["n"] - 1) % self._new_video_sample == 0:
+            return False
+        logger.info(
+            f"[{account}] 新视频av{oid}冷静期内抽样跳过(id={nid}, 第{entry['n']}条)"
+        )
         return True
+
+    def _defer_or_skip(self, account: str, nid: str, reason: str) -> str:
+        """把「暂时无法判定」的条目延后到下一轮，最多 DEFER_MAX 次后放弃。
+
+        必须有上限：元数据若被长期风控，无上限的 defer 会让已读游标永久
+        卡在该条，后续所有评论都不再处理。
+        """
+        count = self._defer.get(nid, 0) + 1
+        if count >= DEFER_MAX:
+            self._defer.pop(nid, None)
+            logger.warning(
+                f"[{account}] {reason}，已连续 {count} 次，放弃该条(id={nid})"
+            )
+            return "skipped"
+        self._defer[nid] = count
+        if len(self._defer) > 500:
+            for old_nid in list(self._defer)[: len(self._defer) - 500]:
+                self._defer.pop(old_nid, None)
+        logger.info(f"[{account}] {reason}，本轮延后(id={nid}, 第{count}次)")
+        return "defer"
 
     async def _resolve_at_uname(self, mid: str) -> str | None:
         """查询并缓存 at 目标昵称（TTL 24小时，落 comment_state.json）。
@@ -826,9 +1009,15 @@ class CommentReplyManager:
     async def _reply_worker(self):
         """回复发送循环：逐条取出队列中的回复，用Y账号发送并限速+随机延迟"""
         while True:
+            if not self._send_guard.allow():
+                # 发送风控冷却中：不从队列取件（已入队的回复留待解禁后发出），
+                # 否则暂停形同虚设，会继续按 min_interval 往 reply/add 打请求
+                logger.debug("评论发送风控冷却中，暂停发送队列")
+                await asyncio.sleep(30)
+                continue
             req = await self._reply_queue.get()
             try:
-                ok, at_ok = await self._y_client.send_reply(
+                ok, at_ok, throttled = await self._y_client.send_reply(
                     req["oid"],
                     req["root"],
                     req["parent"],
@@ -836,7 +1025,14 @@ class CommentReplyManager:
                     req["rtype"],
                     req.get("at_map"),
                 )
-                if ok:
+                if throttled:
+                    # 账号级发送风控：立即暂停整个发送队列与轮询，否则会继续恶化
+                    self._send_guard.record_failure()
+                    self._alert(
+                        f"评论发送触发风控，已暂停发送 {SEND_RATE_LIMIT_PAUSE} 秒"
+                    )
+                elif ok:
+                    self._send_guard.record_success()
                     at_map = req.get("at_map") or {}
                     if at_map and not at_ok:
                         # at未生效（昵称变更/风控吞at）：记warning不重试，不阻断后续发送
@@ -862,6 +1058,26 @@ class CommentReplyManager:
             await asyncio.sleep(
                 self._min_interval + random.uniform(0, self._random_delay_max)
             )
+
+    def _alert(self, text: str):
+        """异常告警：10 分钟去重，异步推送，不阻塞轮询/发送"""
+        if self._on_alert is None:
+            return
+        now = time.time()
+        if now - self._last_alert_at < 600:
+            return
+        self._last_alert_at = now
+        logger.warning(f"[评论区告警] {text}")
+        try:
+            asyncio.create_task(self._safe_alert(text))
+        except Exception as e:
+            logger.debug(f"告警任务创建失败: {e}")
+
+    async def _safe_alert(self, text: str):
+        try:
+            await self._on_alert(text)
+        except Exception as e:
+            logger.warning(f"评论区告警推送失败: {e}")
 
     @staticmethod
     def _to_int(value: str):

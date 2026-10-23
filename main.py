@@ -331,7 +331,7 @@ class LlmChatService:
             return text, at_flag
 
 
-@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.2.0")
+@register("astrbot_plugin_bilibili_live_mod", "ambersmaller", "B站回复机器人", "3.3.0")
 class BilibiliLive(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -421,6 +421,8 @@ class BilibiliLive(Star):
         self.comment_manager: CommentReplyManager | None = None
         # 视频内容识别器（评论区回复用：元数据→一句话概括→按视频缓存）
         self._video_ctx_manager: VideoContextManager | None = None
+        # X投稿列表低频同步任务（本地命中即免去逐视频元数据请求）
+        self._x_sync_task: asyncio.Task | None = None
 
     def _get_cookie_str(self) -> str:
         """从配置中的三个 cookie 字段拼接 cookie 字符串（跳过空值）"""
@@ -464,6 +466,7 @@ class BilibiliLive(Star):
         self.comment_manager = self._create_comment_manager()
         if self.comment_manager:
             await self.comment_manager.start()
+            self._start_x_video_sync()
         if self.config["blivedm_web"]["enable"]:
             if self.config.get("live_monitor", {}).get("enable"):
                 # 开播监控模式：不常驻直播间，轮询开播状态，开播才进房
@@ -1081,6 +1084,12 @@ class BilibiliLive(Star):
             get_video_meta=self._get_video_meta,
             resolve_route=resolve_route,
             has_routes=bool(routes),
+            # [3.3] 本地归属快路径（免请求）+ 异常告警 + 新视频冷静期抽样
+            get_video_owner=self._get_video_owner,
+            on_alert=self._comment_alert,
+            new_video_cooldown=max(0, int(conf.get("new_video_cooldown", 10) or 0))
+            * 60,
+            new_video_sample=max(1, int(conf.get("new_video_sample", 3) or 1)),
         )
 
     def _parse_persona_routes(self, conf: dict) -> list[dict]:
@@ -1231,10 +1240,29 @@ class BilibiliLive(Star):
         await self._ensure_video_ctx_manager()
         return await self._video_ctx_manager.get_meta(oid)
 
+    async def _get_video_owner(self, oid: str) -> dict | None:
+        """评论归属快路径（0 请求）：进程缓存/长期落盘/X投稿列表，命中即免去网络"""
+        await self._ensure_video_ctx_manager()
+        return await self._video_ctx_manager.get_owner(oid)
+
+    async def _comment_alert(self, text: str):
+        """评论区异常告警推送：优先 comment_reply.alert_destinations，
+        留空则复用开播监控的 notify_destinations（两者都空则只留日志）"""
+        conf = self.config.get("comment_reply", {}) or {}
+        dests = list(conf.get("alert_destinations") or [])
+        if not dests:
+            dests = list(
+                (self.config.get("live_monitor", {}) or {}).get("notify_destinations")
+                or []
+            )
+        if dests:
+            await self._notify(dests, f"【B站评论】{text}")
+
     async def _ensure_video_ctx_manager(self):
         """懒加载视频元数据/概括管理器（与 _get_video_context 共用同一实例）；
-        wbi 签名由评论 Y 客户端注入（评论功能必然要求 Y 登录态，且
-        comment_manager 先于本管理器创建，注入源必然就绪）"""
+        wbi 签名与 Cookie 均由评论 Y 客户端注入（评论功能必然要求 Y 登录态，
+        且 comment_manager 先于本管理器创建，注入源必然就绪）。
+        元数据接口匿名直连会被 WAF 拦（HTTP 412），故必须携带登录态"""
         if self._video_ctx_manager is None:
             wbi_sign = None
             if self.comment_manager is not None:
@@ -1243,8 +1271,57 @@ class BilibiliLive(Star):
                 self._data_dir() / "video_context.json",
                 summarize=self._summarize_video,
                 wbi_sign=wbi_sign,
+                get_cookie=self._get_cookie_str,
             )
             await self._video_ctx_manager.start()
+
+    def _start_x_video_sync(self):
+        """启动X投稿列表低频同步（未启用X账号或间隔为0时不启动）。
+        投稿列表命中即可直接判定「X自己的视频」，全程零元数据请求——
+        这也是新视频首发时不再逐视频打 view/detail 的关键"""
+        try:
+            interval = int(
+                (self.config.get("comment_reply", {}) or {}).get(
+                    "x_video_sync_interval", 30
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            interval = 30
+        if interval <= 0:
+            return
+        if not self.comment_manager or not self.comment_manager.x_mid:
+            return
+        self._x_sync_task = asyncio.create_task(
+            self._x_video_sync_loop(interval * 60)
+        )
+
+    async def _x_video_sync_loop(self, interval: float):
+        """低频同步X投稿列表：失败保留旧表（旧表仍可判归属），连续3次告警。
+        单飞由 VideoContextManager._x_sync_lock 保证，不阻塞评论处理"""
+        failures = 0
+        # 启动后稍等再拉，避免与插件启动期的其他请求叠加
+        await asyncio.sleep(min(60.0, max(5.0, interval / 10)))
+        while True:
+            try:
+                mid = self.comment_manager.x_mid if self.comment_manager else ""
+                if mid:
+                    await self._ensure_video_ctx_manager()
+                    count = await self._video_ctx_manager.sync_x_videos(mid)
+                    if count < 0:
+                        failures += 1
+                        # 每连续失败3次告警一次（10分钟去重由 _alert 负责）
+                        if failures >= 3 and failures % 3 == 0:
+                            await self._comment_alert(
+                                "X投稿列表同步连续失败，已回退逐视频查询"
+                            )
+                    else:
+                        failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"X投稿列表同步异常: {e}")
+            await asyncio.sleep(interval)
 
     async def _summarize_video(self, metadata: dict) -> str | None:
         """调用LLM把视频公开元数据概括为一句话（≤80字）。
@@ -1572,6 +1649,15 @@ class BilibiliLive(Star):
             dropped = self.batch_buffer.reset()
             if dropped:
                 logger.info(f"插件卸载，丢弃未冲刷的 {dropped} 条攒批消息")
+        if self._x_sync_task:
+            self._x_sync_task.cancel()
+            try:
+                await asyncio.wait_for(self._x_sync_task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.warning(f"停止X投稿列表同步任务时出现异常: {e}")
+            self._x_sync_task = None
         if self.comment_manager:
             await self.comment_manager.stop()
             self.comment_manager = None
