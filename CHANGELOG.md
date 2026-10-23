@@ -2,7 +2,23 @@
 
 所有重要变更都会记录在本文件中。
 
+## [3.3.1] - 2026-10-23
+
+### Removed
+- 移除「X投稿列表定时同步」（3.3.0 内部迭代引入、未对外发布）：原按 30 分钟拉取 `x/space/wbi/arc/search` 缓存 X 的 aid 集合，最多只为每个新视频省下 1 次 `view/detail`——而视频归属一旦取到就会写入 `video_owners.json` 长期复用，实际节约极小；代价却是约 48 次/天的 space 接口请求，且 space 系接口风控阈值比 `view/detail` 更低，性价比为负。归属判定回退为单一数据源：`video_owners.json` + 按需 `view/detail`。存量配置中的 `x_video_sync_interval` 不再被读取，无影响。
+- 移除「新视频冷静期抽样」（3.3.0 内部迭代引入、未对外发布，原 `new_video_cooldown` / `new_video_sample`）：该功能会静默丢弃评论（用户侧表现为“漏回”），且降低的是回复**总量**而非**发送速率**——而风控主要看速率，速率已由 `min_interval`、`max_replies_per_cycle` 与发送熔断控制。场景本身也偏稀有：`msgfeed/reply` 不含「无人回复过的全新顶层评论」，新视频首发期的纯顶层评论根本不会进入插件。存量配置中的这两个键不再被读取，无影响。
+- 同步删除 `video_context.sync_x_videos()`、`x_videos.json`、`_x_sync_lock`、`CommentReplyManager.x_mid`、`new_video_*` 构造参数、`_cooldown_skip()` 与 `comment_state.json` 的 `video_seen` 键。
+
+### Changed
+- 视频归属判定简化为单一数据源（进程缓存 → `video_owners.json` → 按需 `view/detail`），不再存在两份可能互相矛盾的归属缓存。
+- 版本号升至 3.3.1（`metadata.yaml` 与 `@register` 同步）。3.3.0 为未发布的内部迭代版本，实际能力以本节为准。
+
+### 行为提示（升级必读）
+- 新视频发布后不再抽样，评论按正常节奏回复（每轮 ≤ `max_replies_per_cycle` 条，间隔 ≥ `min_interval` 秒）。若担心首发期回复过密，把 `max_replies_per_cycle` 设为 1、`min_interval` 设为 60~90 即可，无需新功能。
+
 ## [3.3.0] - 2026-10-23
+
+> 内部迭代版本，未对外发布；其「X投稿列表同步」与「新视频冷静期抽样」已在 3.3.1 移除，实际能力以 3.3.1 为准。
 
 ### Added
 - 新增「新视频洪峰保护」（`评论回复→new_video_cooldown` 默认10分钟、`new_video_sample` 默认3）：视频首次被插件看到后的冷静期内第1条评论必回、其后每N条回1条，其余标记已读跳过。新视频发布瞬间的评论洪峰是风控高发时段，逐条回复既无意义也会把接口打到限频。

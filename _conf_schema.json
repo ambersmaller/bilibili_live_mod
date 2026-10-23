@@ -283,24 +283,6 @@
         "default": true,
         "hint": "只作用于X账号收到的通知：X在他人视频下留言后被回复、且该视频非X所有的，一律不回复；联合投稿中X为staff成员也算自己视频。注意本开关不约束Y账号自身的通知。元数据查询失败且本地无归属缓存时该条评论不回复（宁缺毋滥，风控解除后自动补回）。"
       },
-      "new_video_cooldown": {
-        "description": "新视频冷静期（分钟，0为关闭）",
-        "type": "int",
-        "default": 10,
-        "hint": "视频首次被插件看到后的N分钟内评论按比例抽样回复，避免新视频发布瞬间的评论洪峰冲击B站接口（风控高发期）；填0关闭。"
-      },
-      "new_video_sample": {
-        "description": "冷静期内抽样比例（每N条回复1条）",
-        "type": "int",
-        "default": 3,
-        "hint": "冷静期内第1条评论必回，其后每N条回1条；填1为不抽样（全部回复）。"
-      },
-      "x_video_sync_interval": {
-        "description": "X账号投稿列表同步间隔（分钟，0为关闭）",
-        "type": "int",
-        "default": 30,
-        "hint": "低频拉取X的投稿列表，命中即免去该视频的元数据请求，显著降低风控概率；关闭后完全依赖逐视频查询。需启用X账号。"
-      },
       "alert_destinations": {
         "description": "评论区异常告警推送目标（umo）",
         "type": "list",
@@ -308,7 +290,7 @@
         "items": {
           "type": "string"
         },
-        "hint": "留空则复用开播监控的 notify_destinations。仅在元数据熔断、发送风控暂停、投稿列表同步连续失败时推送。"
+        "hint": "留空则复用开播监控的 notify_destinations。仅在元数据熔断、发送风控暂停时推送。"
       },
       "persona_routes": {
         "description": "按视频tag的人设路由（最多5条，按顺序匹配，命中即用）",

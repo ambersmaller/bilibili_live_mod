@@ -2,12 +2,12 @@
 
 参考 bilibili-ai-bot 的视频识别管线。元数据层（get_meta）：`view/detail`
 一次取回 View（owner.mid/staff[]）与 Tags[]，供「仅回复X自己视频」过滤与
-tag 人设路由使用；不依赖 LLM、不受 video_context 开关影响，带三层缓存：
+tag 人设路由使用；不依赖 LLM、不受 video_context 开关影响，带两层缓存：
 进程内 aid 缓存（TTL 10 分钟）→ 长期归属缓存 video_owners.json（30 天，跨
-重启）→ X 投稿列表 x_videos.json（见 get_owner）。概括层（get_context）：
+重启，由 get_owner 提供 0 请求的本地查询）。概括层（get_context）：
 LLM 一句话概括后按视频(bvid)落盘缓存，以【当前视频信息】注入回复提示词最前。
 
-风控加固（v3.3.0）：
+风控加固（v3.3.0 起）：
 1. 元数据请求携带 Y 账号 Cookie（本插件唯一曾匿名直连的接口），并显式检查
    HTTP 状态码——此前 412/HTML 被伪装成「JSON 解析失败」，无从排查。
 2. 失败写负缓存（META_FAIL_TTL）并计入 FailureGuard，连续失败即熔断，
@@ -29,8 +29,6 @@ from .failure_guard import FailureGuard
 
 # 一次请求同时取回 View（owner/staff）与 Tags 的接口（tag 路由与 owner 过滤的共用数据源）
 VIEW_DETAIL_URL = "https://api.bilibili.com/x/web-interface/view/detail"
-# UP主投稿列表（低频同步X的视频aid集合，命中即免去逐视频元数据请求）
-SPACE_ARC_SEARCH_URL = "https://api.bilibili.com/x/space/wbi/arc/search"
 
 # 注入prompt的简介上限（字）：视频信息模板与降级拼接共用
 DESC_MAX = 250
@@ -47,9 +45,8 @@ META_GUARD_COOLDOWN = 300
 OWNER_TTL = 30 * 86400
 # tags 新鲜度：超期的缓存仍可判 owner，但不再参与 tag 路由（避免用过期标签误路由）
 OWNER_TAGS_TTL = 86400
-# 两个落盘缓存的最大条目数（超出按时间淘汰最早的一半）
+# 落盘归属缓存的最大条目数（超出按时间淘汰最早的一半）
 OWNER_MAX = 2000
-X_VIDEOS_MAX = 2000
 
 CONTEXT_TEMPLATE = (
     "【当前视频信息】\n"
@@ -95,7 +92,6 @@ class VideoContextManager:
         # 元数据锁：仅保护网络请求与内存字典（LLM概括另用 _summary_lock，防长时间阻塞）
         self._lock = asyncio.Lock()
         self._summary_lock = asyncio.Lock()
-        self._x_sync_lock = asyncio.Lock()
         self._guard = FailureGuard(
             threshold=META_GUARD_THRESHOLD,
             cooldown=META_GUARD_COOLDOWN,
@@ -106,11 +102,8 @@ class VideoContextManager:
         self._meta_cache: dict[str, tuple[float, dict]] = {}
         # 元数据负缓存：aid -> 失败时间（期内不再请求同一视频）
         self._meta_fail: dict[str, float] = {}
-        # 长期归属缓存与X投稿列表（均为 aid -> entry，_meta 另存内存）
-        self._owners, self._owners_meta = self._load_nested("video_owners.json")
-        self._x_videos, x_meta = self._load_nested("x_videos.json")
-        self._x_mid = str(x_meta.get("mid") or "")
-        self._x_synced_at = float(x_meta.get("synced_at") or 0)
+        # 长期归属缓存（aid -> entry）
+        self._owners, _ = self._load_nested("video_owners.json")
 
     async def start(self):
         if self._session is None:
@@ -131,9 +124,8 @@ class VideoContextManager:
             return await self._get_meta_cached(oid)
 
     async def get_owner(self, oid: str) -> dict | None:
-        """纯本地归属查询（0 请求）：进程缓存 → 长期归属缓存 → X投稿列表。
-        命中即可判定 owner（含联合投稿staff），未命中返回 None 由调用方决定是否联网。
-        X投稿列表命中视为终局判定（该视频确为X发布），不再回退网络"""
+        """纯本地归属查询（0 请求）：进程缓存 → 长期归属缓存。
+        命中即可判定 owner（含联合投稿staff），未命中返回 None 由调用方决定是否联网"""
         async with self._lock:
             return self._owner_view(oid)
 
@@ -155,89 +147,6 @@ class VideoContextManager:
         except Exception as e:
             logger.warning(f"视频内容识别失败(oid={oid}): {e}")
             return None
-
-    async def sync_x_videos(self, mid: str, ps: int = 50) -> int:
-        """同步 X 账号投稿列表（低频，wbi签名+Cookie）。
-        成功返回条目数并整体替换本地表；失败返回 -1 且保留旧表（旧表仍可用）"""
-        if not mid or self._session is None:
-            return -1
-        params = {
-            "mid": mid,
-            "ps": str(ps),
-            "pn": "1",
-            "order": "pubdate",
-            "platform": "web",
-            "web_location": "1550101",
-        }
-        if self._wbi_sign is not None:
-            try:
-                signed = await self._wbi_sign(params)
-            except Exception as e:
-                logger.warning(f"X投稿列表wbi签名失败: {e}")
-                return -1
-            if signed is not None:
-                params = signed
-        async with self._x_sync_lock:
-            try:
-                async with self._session.get(
-                    SPACE_ARC_SEARCH_URL,
-                    params=params,
-                    headers=self._headers(),
-                ) as resp:
-                    if resp.status != 200:
-                        body = (await resp.text())[:120].replace("\n", " ")
-                        logger.warning(
-                            f"同步X投稿列表失败: HTTP {resp.status}, body={body!r}"
-                        )
-                        return -1
-                    result = await resp.json()
-            except Exception as e:
-                logger.warning(f"同步X投稿列表失败: {e}")
-                return -1
-            if not isinstance(result, dict):
-                logger.warning("同步X投稿列表失败: 响应格式异常")
-                return -1
-            if result.get("code") != 0:
-                logger.warning(
-                    f"同步X投稿列表失败: code={result.get('code')}, "
-                    f"message={result.get('message')}"
-                )
-                return -1
-            vlist = (
-                ((result.get("data") or {}).get("list") or {}).get("vlist")
-            ) or []
-            videos = {}
-            for item in vlist:
-                aid = str((item or {}).get("aid") or "").strip()
-                if not aid:
-                    continue
-                videos[aid] = {
-                    "bvid": item.get("bvid") or "",
-                    "title": item.get("title") or "",
-                    "created": int(item.get("created") or 0),
-                }
-            if len(videos) > X_VIDEOS_MAX:
-                keep = sorted(
-                    videos.items(),
-                    key=lambda kv: kv[1].get("created") or 0,
-                    reverse=True,
-                )[:X_VIDEOS_MAX]
-                videos = dict(keep)
-            # 整体换引用（读者不会看到半张表），再落盘
-            self._x_videos = videos
-            self._x_mid = str(mid)
-            self._x_synced_at = time.time()
-            self._save_nested(
-                "x_videos.json",
-                self._x_videos,
-                {
-                    "mid": self._x_mid,
-                    "synced_at": self._x_synced_at,
-                    "count": len(videos),
-                },
-            )
-            logger.info(f"X投稿列表已同步: {len(videos)} 个视频(mid={mid})")
-            return len(videos)
 
     async def _get_meta_cached(self, oid: str) -> dict | None:
         """取元数据（须持有 self._lock）：缓存/负缓存/熔断 → 网络 → 落盘归属"""
@@ -262,33 +171,17 @@ class VideoContextManager:
         return meta
 
     def _owner_view(self, oid: str) -> dict | None:
-        """纯本地归属视图（须持有 self._lock）：进程缓存 → 长期归属 → X投稿列表"""
+        """纯本地归属视图（须持有 self._lock）：进程缓存 → 长期归属缓存"""
         cached = self._meta_cache.get(oid)
         if cached is not None:
             return dict(cached[1], source="meta")
         entry = self._owners.get(oid)
         if isinstance(entry, dict) and self._owner_fresh(entry):
             return self._owner_meta(entry, "owner_cache")
-        x_entry = self._x_videos.get(oid)
-        if isinstance(x_entry, dict) and self._x_mid:
-            return {
-                "bvid": x_entry.get("bvid") or "",
-                "title": x_entry.get("title") or "",
-                "owner_name": "",
-                "owner_mid": self._x_mid,
-                "staff_mids": [],
-                "tname": "",
-                "desc": "",
-                "duration": 0,
-                "tags": None,
-                "created": int(x_entry.get("created") or 0),
-                "from_cache": True,
-                "source": "x_list",
-            }
         return None
 
     def _local_owner(self, oid: str) -> dict | None:
-        """网络不可用时的降级视图：过期进程缓存 > 长期归属 > X投稿列表"""
+        """网络不可用时的降级视图：过期进程缓存 > 长期归属缓存"""
         cached = self._meta_cache.get(oid)
         if cached is not None:
             return dict(cached[1], from_cache=True, source="stale_meta")
@@ -302,9 +195,6 @@ class VideoContextManager:
         entry = self._owners.get(oid)
         if isinstance(entry, dict):
             return str(entry.get("bvid") or "")
-        x_entry = self._x_videos.get(oid)
-        if isinstance(x_entry, dict):
-            return str(x_entry.get("bvid") or "")
         return ""
 
     @staticmethod

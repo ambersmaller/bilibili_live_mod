@@ -9,7 +9,7 @@ v3.0.0 新增：X账号『仅回复自己视频』过滤（owner/staff 判定）
 （Route 数据类，由宿主注入的 resolve_route 判定）、回复中@指定用户
 （at_name_to_mid 拼装 + 发送后校验）。
 
-v3.3.0 风控加固：判断顺序改为「本地归属(0请求) → 新视频冷静期抽样 → 元数据」，
+v3.3.0 风控加固：判断顺序改为「本地归属(0请求) → 元数据」，
 已读游标按实际处理结果推进（defer 可补回、最多延后3次），元数据失败由负缓存
 与熔断拦截，发送命中风控码即暂停队列，并支持洪峰期自适应拉长轮询间隔。
 """
@@ -64,9 +64,6 @@ POLL_INTERVAL_MAX = 1800
 
 # 单条通知最多延后几次（必须有上限：否则元数据长期不可用会让已读游标永久卡死）
 DEFER_MAX = 3
-
-# 新视频抽样计数表（comment_state.json → video_seen）容量上限
-VIDEO_SEEN_MAX = 500
 
 # 频率/风控类错误码（BiliCommentBot 实战汇总），触发时应调大发送间隔
 RATE_LIMIT_CODES = {-412, -509, 412, 509, 799, 10403}
@@ -442,8 +439,6 @@ class CommentReplyManager:
         has_routes=False,
         get_video_owner=None,
         on_alert=None,
-        new_video_cooldown=600,
-        new_video_sample=3,
     ):
         """
         :param on_reply_needed: async (account_label, prompt_text, oid, root_id, route)
@@ -465,11 +460,9 @@ class CommentReplyManager:
         :param has_routes: 路由表是否非空（惰性元数据获取的条件之一：
             仅当 X账号+owner过滤 或 路由表非空 时才请求元数据）
         :param get_video_owner: async (oid) -> dict | None，纯本地归属查询
-            （0 请求，进程缓存/长期落盘/投稿列表），命中即免去元数据请求
+            （0 请求，进程缓存/长期落盘），命中即免去元数据请求
         :param on_alert: async (text) -> None，异常告警回调（元数据熔断、
-            发送风控、投稿列表同步连续失败时触发），None 表示不推送
-        :param new_video_cooldown: 新视频冷静期（秒），0 表示关闭抽样
-        :param new_video_sample: 冷静期内每 N 条回 1 条（1 表示不抽样）
+            发送风控时触发），None 表示不推送
         """
         self._y_client = y_client
         self._x_client = x_client
@@ -498,8 +491,6 @@ class CommentReplyManager:
         self._at_uname_lock = asyncio.Lock()
         self._get_video_owner = get_video_owner
         self._on_alert = on_alert
-        self._new_video_cooldown = max(0.0, float(new_video_cooldown))
-        self._new_video_sample = max(1, int(new_video_sample))
         # 发送风控闸门：命中风控码立即打开（threshold=1），冷却期内不轮询不发送
         self._send_guard = FailureGuard(
             threshold=1, cooldown=SEND_RATE_LIMIT_PAUSE, name="评论发送"
@@ -515,11 +506,6 @@ class CommentReplyManager:
     def y_client(self) -> BiliCommentClient:
         """Y账号客户端（宿主注入元数据层 wbi 签名等用途）"""
         return self._y_client
-
-    @property
-    def x_mid(self) -> str:
-        """X账号mid（未启用或登录态校验失败时为空串）"""
-        return self._account_mids.get("X", "")
 
     async def start(self):
         """启动轮询与回复任务。Y账号登录态必需，X账号登录态失败仅禁用X轮询"""
@@ -717,7 +703,7 @@ class CommentReplyManager:
                     f"({self._max_reply_depth})，不再回复(id={nid})"
                 )
                 return "skipped"
-        # [3.3] 本地归属（0 请求）：进程缓存 → 长期归属落盘 → X投稿列表。
+        # [3.3] 本地归属（0 请求）：进程缓存 → 长期归属落盘。
         # 命中即可直接判 owner，不再为每条评论发一次 view/detail（此前新视频评论
         # 洪峰会把同一条匿名请求打穿，触发 WAF 412）
         owner = None
@@ -726,10 +712,6 @@ class CommentReplyManager:
                 owner = await self._get_video_owner(oid)
             except Exception as e:
                 logger.debug(f"[{account}] 本地视频归属查询失败(oid={oid}): {e}")
-        # [3.3] 新视频冷静期抽样：纯本地判定，必须早于任何网络请求，
-        # 否则新视频发布瞬间的评论洪峰仍会逐条打到元数据接口
-        if self._cooldown_skip(account, oid, nid, owner):
-            return "skipped"
         meta = None
         if account == "X" and self._x_owner_only:
             # 仅回复X自己发布的视频下的评论（含联合投稿X为staff）。
@@ -897,48 +879,6 @@ class CommentReplyManager:
         except Exception as e:
             logger.warning(f"[{account}] 视频元数据获取失败(id={nid}): {e}")
             return None
-
-    def _cooldown_skip(
-        self, account: str, oid: str, nid: str, owner: dict | None
-    ) -> bool:
-        """新视频冷静期抽样（纯本地）：视频首次被看到后的 cooldown 秒内，
-        第1条评论必回，其后每 sample 条回 1 条，其余标记已读跳过。
-
-        新视频发布瞬间的评论洪峰最容易触发风控，逐条回复既无意义也会把
-        元数据/发送接口打到限频。起点优先用视频发布时间(pubdate)，未知时
-        用首次看到的时间——老视频的 pubdate 很早，天然不会进入冷静期。
-        抽样计数落 comment_state.json 的 video_seen，跨重启继续生效。
-        """
-        if self._new_video_cooldown <= 0 or self._new_video_sample <= 1:
-            return False
-        now = time.time()
-        seen = self._state.setdefault("video_seen", {})
-        entry = seen.get(oid)
-        if not isinstance(entry, dict):
-            created = int((owner or {}).get("created") or 0)
-            entry = {"first": created or now, "n": 0}
-            seen[oid] = entry
-            if len(seen) > VIDEO_SEEN_MAX:
-                for old_oid in list(seen)[: len(seen) - VIDEO_SEEN_MAX]:
-                    seen.pop(old_oid, None)
-        entry["n"] = int(entry.get("n") or 0) + 1
-        # 起点校正：拿到视频真实发布时间后，若明显早于「首次看到」的时间，
-        # 说明这是老视频（此前按 now 记的起点），改用发布时间 → 立即退出冷静期
-        created = int((owner or {}).get("created") or 0)
-        if created and created < float(entry.get("first") or 0) - 60:
-            entry["first"] = created
-        self._save_state()
-        if entry["n"] == 1:
-            return False
-        if now - float(entry.get("first") or now) >= self._new_video_cooldown:
-            return False
-        # 第1条已必定回复，其余按 (n-1) 取模：sample=3 时第1、4、7…条回复
-        if (entry["n"] - 1) % self._new_video_sample == 0:
-            return False
-        logger.info(
-            f"[{account}] 新视频av{oid}冷静期内抽样跳过(id={nid}, 第{entry['n']}条)"
-        )
-        return True
 
     def _defer_or_skip(self, account: str, nid: str, reason: str) -> str:
         """把「暂时无法判定」的条目延后到下一轮，最多 DEFER_MAX 次后放弃。
